@@ -1,0 +1,41 @@
+param([int]$Port = 8792)
+
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Security
+$sourceWorkbench = "C:\Users\admin\Documents\ai效果图工作台"
+
+function Read-DpapiSecret([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    try {
+        $secure = (Get-Content -LiteralPath $Path -Encoding utf8 | Select-Object -First 1) | ConvertTo-SecureString
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    } catch { return "" }
+}
+
+function Read-MachineSecret([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    try {
+        $protected = [Convert]::FromBase64String((Get-Content -LiteralPath $Path -Encoding utf8 | Select-Object -First 1))
+        return [Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine))
+    } catch { return "" }
+}
+
+function Load-Secret([string]$Name, [string]$UserFile, [string]$MachineFile) {
+    if (-not (Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue).Value) {
+        $value = Read-DpapiSecret (Join-Path $sourceWorkbench ".secrets\$UserFile")
+        if (-not $value) { $value = Read-MachineSecret (Join-Path $sourceWorkbench ".secrets\$MachineFile") }
+        if ($value) { Set-Item -Path "Env:$Name" -Value $value }
+    }
+}
+
+Set-Location -LiteralPath $PSScriptRoot
+Load-Secret "GRSAI_API_KEY" "grsai_api_key.dpapi" "grsai_api_key.machine"
+Load-Secret "NANO_BANANA_API_KEY" "nano_banana_api_key.dpapi" "nano_banana_api_key.machine"
+Load-Secret "FAST_BANANA_API_KEY" "fast_banana_api_key.dpapi" "fast_banana_api_key.machine"
+$env:COMMERCIAL_ENV = if ($env:COMMERCIAL_ENV) { $env:COMMERCIAL_ENV } else { "development" }
+$env:COMMERCIAL_DATA_DIR = Join-Path $PSScriptRoot "data"
+$env:PORT = "$Port"
+
+& (Get-Command python -ErrorAction Stop).Source -m uvicorn commercial_app:app --host 0.0.0.0 --port $Port

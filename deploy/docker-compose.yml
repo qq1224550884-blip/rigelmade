@@ -1,0 +1,42 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: ai-render-commercial-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8792"
+      COMMERCIAL_ENV: production
+      COMMERCIAL_DATA_DIR: /app/data
+      COMMERCIAL_CORS_ORIGINS: ${SITE_ORIGIN:-https://example.com}
+    volumes:
+      - ./data:/app/data
+      - ./certs:/certs:ro
+    expose:
+      - "8792"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8792/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    container_name: ai-render-commercial-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      ANALYTICS_GA4_ID: ${ANALYTICS_GA4_ID:-}
+      ANALYTICS_BAIDU_ID: ${ANALYTICS_BAIDU_ID:-}

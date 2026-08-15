@@ -1,0 +1,40 @@
+# ===== 密钥 / 证书 / 环境变量（绝不入库）=====
+# 真实环境变量：API Key、微信支付密钥、商户私钥等
+.env
+.env.*
+!.env.example
+deploy/.env
+deploy/certs/
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+apikey*
+*api_key*
+
+# ===== 运行数据 / 数据库（含用户、订单、积分流水）=====
+data/
+*.sqlite3
+*.db
+*.sqlite
+
+# ===== 日志 / 缓存 / 临时文件 =====
+logs/
+__pycache__/
+*.pyc
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
+
+# ===== 前端依赖与构建产物 =====
+node_modules/
+web/web/node_modules/
+web/canvas-agent/node_modules/
+plugins/canvas/*/node_modules/
+dist/
+build/
+web/public/plugins/
+plugins/canvas/*/dist/

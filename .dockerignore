@@ -1,0 +1,11 @@
+.git
+**/node_modules
+**/__pycache__
+**/.secrets
+**/data
+**/logs
+deploy/.env
+deploy/certs
+web/web/dist
+web/web/node_modules
+*.sqlite3
