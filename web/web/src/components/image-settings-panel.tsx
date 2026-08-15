@@ -3,6 +3,7 @@ import { ConfigProvider, Switch } from "antd";
 
 import { type CanvasTheme } from "@/lib/canvas-theme";
 import type { AiConfig } from "@/stores/use-config-store";
+import { usePricing } from "@/services/pricing";
 
 const qualityOptions = [
     { value: "auto", label: "自动" },
@@ -43,8 +44,11 @@ type ImageSettingsPanelProps = {
 
 export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5", maxCount = 15, quickCount = 10 }: ImageSettingsPanelProps) {
     const [snapDimensionToStep, setSnapDimensionToStep] = useState(true);
+    const { estimateImageCredits, pricingLoading } = usePricing();
     const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
+    const imageModel = (config.model || config.imageModel || "").includes("::") ? config.model.split("::")[1] || config.model : config.model || config.imageModel || "";
+    const estimatedCredits = estimateImageCredits(imageModel, quality, count);
     const activeSize = config.size || "auto";
     const transparentBackground = config.background === "transparent";
     const selectedAspect = aspectOptions.find((item) => (item.size || item.value) === activeSize || item.value === activeSize);
@@ -139,6 +143,28 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         ))}
                         <CountInput value={count} max={maxCount} theme={theme} onChange={(value) => onConfigChange("count", String(value || 1))} />
                     </div>
+                </div>
+                <div
+                    className="flex items-center justify-between rounded-xl border px-3 py-2"
+                    style={{ borderColor: theme.node.stroke, background: "transparent" }}
+                >
+                    <span className="text-sm font-medium" style={{ color: theme.node.muted }}>
+                        预计消耗积分
+                    </span>
+                    {pricingLoading ? (
+                        <span className="text-sm" style={{ color: theme.node.text }}>
+                            …
+                        </span>
+                    ) : estimatedCredits != null ? (
+                        <span className="text-sm font-semibold" style={{ color: theme.node.text }}>
+                            {estimatedCredits}
+                            <span className="ml-0.5 text-xs font-normal opacity-60">积分</span>
+                        </span>
+                    ) : (
+                        <span className="text-xs" style={{ color: theme.node.muted, opacity: 0.7 }}>
+                            登录后显示
+                        </span>
+                    )}
                 </div>
             </div>
         </ImageSettingsTheme>

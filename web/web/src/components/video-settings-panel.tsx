@@ -2,9 +2,10 @@ import { type ReactNode } from "react";
 import { Switch } from "antd";
 
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
-import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceDurationOptions, seedancePixelLabel, seedanceRatioOptions, seedanceResolutionOptions } from "@/lib/seedance-video";
+import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, normalizeSeedanceResolution, seedancePixelLabel, seedanceRatioOptions, seedanceResolutionOptions } from "@/lib/seedance-video";
 import { type CanvasTheme } from "@/lib/canvas-theme";
 import { type AiConfig } from "@/stores/use-config-store";
+import { usePricing } from "@/services/pricing";
 
 const resolutionOptions = [
     { value: "720", label: "720p" },
@@ -20,6 +21,7 @@ const sizeOptions = [
     { value: "auto", label: "auto", width: 0, height: 0 },
 ];
 
+// 视频时长固定档位：统一为 6 / 10 / 12 / 16 / 20 秒，禁止自由输入导致乱序/重复。
 const secondOptions = [6, 10, 12, 16, 20];
 
 export const videoResolutionOptions = resolutionOptions.map((item) => ({ value: item.value, label: item.label }));
@@ -35,11 +37,14 @@ type VideoSettingsPanelProps = {
 };
 
 export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5" }: VideoSettingsPanelProps) {
+    const { estimateVideoCredits, pricingLoading } = usePricing();
+    const videoModel = (config.videoModel || config.model || "").includes("::") ? (config.videoModel || config.model).split("::")[1] || config.videoModel || config.model || "" : config.videoModel || config.model || "";
+    const estimatedCredits = estimateVideoCredits(videoModel, config.vquality, Number(config.videoSeconds || 6));
     if (isSeedanceVideoConfig(config)) {
-        return <SeedanceVideoSettingsPanel config={config} onConfigChange={onConfigChange} theme={theme} showTitle={showTitle} className={className} />;
+        return <SeedanceVideoSettingsPanel config={config} onConfigChange={onConfigChange} theme={theme} showTitle={showTitle} className={className} estimatedCredits={estimatedCredits} pricingLoading={pricingLoading} />;
     }
 
-    const seconds = config.videoSeconds || "6";
+    const seconds = normalizeVideoSecondsOption(config.videoSeconds);
     const size = normalizeVideoSizeValue(config.size);
     const dimensions = readSizeDimensions(size);
     const resolution = normalizeVideoResolutionValue(config.vquality);
@@ -90,24 +95,24 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
                     </div>
                 </SettingGroup>
                 <SettingGroup title="秒数" color={theme.node.muted}>
-                    <div className="grid grid-cols-3 gap-2.5">
+                    <div className="grid grid-cols-5 gap-2.5">
                         {secondOptions.map((value) => (
                             <OptionPill key={value} selected={seconds === String(value)} theme={theme} onClick={() => onConfigChange("videoSeconds", String(value))}>
                                 {value}s
                             </OptionPill>
                         ))}
-                        <NumberInput value={seconds} min={1} max={20} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} />
                     </div>
                 </SettingGroup>
+                <CreditEstimate estimatedCredits={estimatedCredits} pricingLoading={pricingLoading} theme={theme} />
             </div>
         </ImageSettingsTheme>
     );
 }
 
-function SeedanceVideoSettingsPanel({ config, onConfigChange, theme, showTitle, className }: VideoSettingsPanelProps) {
+function SeedanceVideoSettingsPanel({ config, onConfigChange, theme, showTitle, className, estimatedCredits, pricingLoading }: VideoSettingsPanelProps & { estimatedCredits: number | null; pricingLoading: boolean }) {
     const resolution = normalizeSeedanceResolution(config.vquality);
     const ratio = normalizeSeedanceRatio(config.size);
-    const duration = normalizeSeedanceDuration(config.videoSeconds);
+    const duration = normalizeVideoSecondsOption(config.videoSeconds);
     const generateAudio = boolConfig(config.videoGenerateAudio, true);
     const watermark = boolConfig(config.videoWatermark, false);
 
@@ -143,14 +148,13 @@ function SeedanceVideoSettingsPanel({ config, onConfigChange, theme, showTitle, 
                     </div>
                 </SettingGroup>
                 <SettingGroup title="时长" color={theme.node.muted}>
-                    <div className="grid grid-cols-4 gap-2.5">
-                        {seedanceDurationOptions.map((value) => (
-                            <OptionPill key={value} selected={duration === value} theme={theme} onClick={() => onConfigChange("videoSeconds", String(value))}>
-                                {value === -1 ? "智能" : `${value}s`}
+                    <div className="grid grid-cols-5 gap-2.5">
+                        {secondOptions.map((value) => (
+                            <OptionPill key={value} selected={duration === String(value)} theme={theme} onClick={() => onConfigChange("videoSeconds", String(value))}>
+                                {value}s
                             </OptionPill>
                         ))}
                     </div>
-                    <NumberInput value={String(duration)} min={-1} max={15} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} />
                 </SettingGroup>
                 <SettingGroup title="输出" color={theme.node.muted}>
                     <div className="grid gap-2 rounded-xl border p-2.5" style={{ borderColor: theme.node.stroke }}>
@@ -158,8 +162,33 @@ function SeedanceVideoSettingsPanel({ config, onConfigChange, theme, showTitle, 
                         <SwitchRow label="添加水印" checked={watermark} theme={theme} onChange={(checked) => onConfigChange("videoWatermark", String(checked))} />
                     </div>
                 </SettingGroup>
+                <CreditEstimate estimatedCredits={estimatedCredits} pricingLoading={pricingLoading} theme={theme} />
             </div>
         </ImageSettingsTheme>
+    );
+}
+
+function CreditEstimate({ estimatedCredits, pricingLoading, theme }: { estimatedCredits: number | null; pricingLoading: boolean; theme: CanvasTheme }) {
+    return (
+        <div className="flex items-center justify-between rounded-xl border px-3 py-2" style={{ borderColor: theme.node.stroke, background: "transparent" }}>
+            <span className="text-sm font-medium" style={{ color: theme.node.muted }}>
+                预计消耗积分
+            </span>
+            {pricingLoading ? (
+                <span className="text-sm" style={{ color: theme.node.text }}>
+                    …
+                </span>
+            ) : estimatedCredits != null ? (
+                <span className="text-sm font-semibold" style={{ color: theme.node.text }}>
+                    {estimatedCredits}
+                    <span className="ml-0.5 text-xs font-normal opacity-60">积分</span>
+                </span>
+            ) : (
+                <span className="text-xs" style={{ color: theme.node.muted, opacity: 0.7 }}>
+                    登录后显示
+                </span>
+            )}
+        </div>
     );
 }
 
@@ -177,7 +206,17 @@ export function videoSizeLabel(value: string) {
 
 export function videoSecondsLabel(value: string) {
     if (String(value).trim() === "-1") return "智能";
-    return `${value || "6"}s`;
+    return `${normalizeVideoSecondsOption(value)}s`;
+}
+
+/** 视频时长只允许固定档位 6/10/12/16/20，其余输入归一到最近的合法档位。 */
+export function normalizeVideoSecondsOption(value: string): string {
+    const raw = Number(value);
+    if (!Number.isFinite(raw) || raw <= 0) return "6";
+    const allowed = [6, 10, 12, 16, 20];
+    if (allowed.includes(raw)) return String(raw);
+    const nearest = allowed.reduce((best, item) => (Math.abs(item - raw) < Math.abs(best - raw) ? item : best), 6);
+    return String(nearest);
 }
 
 export function normalizeVideoSizeValue(value: string) {
@@ -231,10 +270,6 @@ function DimensionInput({ prefix, value, disabled, theme, onChange }: { prefix: 
             <input type="number" min={1} disabled={disabled} className="min-w-0 flex-1 bg-transparent px-2 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" value={value || ""} onChange={(event) => onChange(Number(event.target.value) || null)} onMouseDown={(event) => event.stopPropagation()} />
         </label>
     );
-}
-
-function NumberInput({ value, min, max, theme, onChange }: { value: string; min: number; max: number; theme: CanvasTheme; onChange: (value: string) => void }) {
-    return <input type="number" min={min} max={max} className="h-9 rounded-full border bg-transparent px-3 text-center text-sm outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" style={{ borderColor: theme.node.stroke, color: theme.node.text, WebkitTextFillColor: theme.node.text }} value={value} onChange={(event) => onChange(event.target.value)} onMouseDown={(event) => event.stopPropagation()} />;
 }
 
 function SizePreview({ width, height, color }: { width: number; height: number; color: string }) {

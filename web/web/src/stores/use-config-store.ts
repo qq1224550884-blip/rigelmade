@@ -66,9 +66,6 @@ const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
 const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 const LOCAL_WORKBENCH_CHANNEL_ID = "grsai-default";
-// `banana-fast` was an early fixed local proxy.  Keep its id only so that
-// saved browser settings can be migrated into an editable direct channel.
-const LEGACY_FAST_BANANA_CHANNEL_ID = "banana-fast";
 const LOCAL_WORKBENCH_BASE_URL = typeof window === "undefined"
     ? "http://127.0.0.1:8790"
     : window.location.origin;
@@ -82,36 +79,6 @@ const LOCAL_WORKBENCH_MODELS: ChannelModel[] = [
     { name: "seedance-2", capability: "video" },
     { name: "MiniMax-H3", capability: "video" },
 ];
-// toapis 图片生成是异步协议：POST /v1/images/generations 建任务，GET 轮询查结果。
-// 脚本公开显示在渠道编辑器中，用户可根据自己中转站的文档修改；调用时浏览器直接访问中转站。
-const DIRECT_BANANA_SCRIPT = [
-    'const upstreamModel = model === "nano-banana-2" ? "gemini-3.1-flash-image-preview" : model === "nano-banana-pro" ? "gemini-3-pro-image-preview" : model;',
-    'const resolution = params.quality === "high" ? "4K" : params.quality === "medium" ? "2K" : "1K";',
-    'const match = String(params.size || "").match(/^(\\d+)x(\\d+)$/i);',
-    'const target = match ? Number(match[1]) / Number(match[2]) : 1;',
-    'const ratios = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];',
-    'const size = ratios.reduce((best, value) => { const [w, h] = value.split(":").map(Number); const [bw, bh] = best.split(":").map(Number); return Math.abs(w / h - target) < Math.abs(bw / bh - target) ? value : best; }, "1:1");',
-    'const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };',
-    'const payload = { model: upstreamModel, prompt, size, n: 1, metadata: { resolution } };',
-    'const created = await request({ method: "post", url: `${baseUrl}/v1/images/generations`, headers, data: payload });',
-    'const taskId = created.id || created.data?.id || created.task_id;',
-    'if (!taskId) throw new Error("中转站没有返回任务 ID");',
-    'let result = null;',
-    'for (let i = 0; i < 30; i += 1) {',
-    '  await new Promise((resolve) => setTimeout(resolve, 4000));',
-    '  result = await request({ method: "get", url: `${baseUrl}/v1/images/generations/${encodeURIComponent(taskId)}`, headers });',
-    '  if (result.status === "completed") break;',
-    '  if (result.status === "failed") throw new Error(result.error?.message || "图片生成失败");',
-    '}',
-    'const data = result?.result?.data || result?.data || [];',
-    'const urls = data.map((item) => item.url).filter(Boolean);',
-    'if (!urls.length) throw new Error("中转站没有返回图片数据"); return urls;',
-].join("\n");
-const DIRECT_BANANA_MODELS: ChannelModel[] = [
-    { name: "nano-banana-2", capability: "image", script: DIRECT_BANANA_SCRIPT },
-    { name: "nano-banana-pro", capability: "image", script: DIRECT_BANANA_SCRIPT },
-];
-
 function localWorkbenchChannel(): ModelChannel {
     let token = "";
     if (typeof window !== "undefined") {
@@ -119,22 +86,11 @@ function localWorkbenchChannel(): ModelChannel {
     }
     return {
         id: LOCAL_WORKBENCH_CHANNEL_ID,
-        name: "本机",
+        name: "工作台",
         baseUrl: LOCAL_WORKBENCH_BASE_URL,
         apiKey: token || "commercial-login-required",
         apiFormat: "openai",
         models: LOCAL_WORKBENCH_MODELS.map((model) => ({ ...model })),
-    };
-}
-
-function directBananaChannel(): ModelChannel {
-    return {
-        id: LEGACY_FAST_BANANA_CHANNEL_ID,
-        name: "快速渠道",
-        baseUrl: "https://toapis.com",
-        apiKey: "",
-        apiFormat: "openai",
-        models: DIRECT_BANANA_MODELS.map((model) => ({ ...model })),
     };
 }
 
@@ -374,18 +330,7 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     const model = decoded?.model || value;
     const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.some((item) => item.name === model));
     const channel = matched || config.channels[0] || createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
-    return resolveSharedFastBananaKey(config, channel);
-}
-
-/** The direct fast channel can reuse a key already configured for the same pdhlzy endpoint without duplicating it in browser storage. */
-function resolveSharedFastBananaKey(config: AiConfig, channel: ModelChannel): ModelChannel {
-    if (channel.id !== LEGACY_FAST_BANANA_CHANNEL_ID || channel.apiKey.trim() || !isPdhlzyUrl(channel.baseUrl)) return channel;
-    const shared = config.channels.find((candidate) => candidate.id !== channel.id && candidate.apiKey.trim() && sameApiBaseUrl(candidate.baseUrl, channel.baseUrl));
-    return shared ? { ...channel, apiKey: shared.apiKey } : channel;
-}
-
-function sameApiBaseUrl(left: string, right: string) {
-    return left.trim().replace(/\/+$/, "").toLowerCase() === right.trim().replace(/\/+$/, "").toLowerCase();
+    return channel;
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
@@ -400,39 +345,10 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
 }
 
 function normalizeChannels(config: AiConfig) {
-    const persistedChannels = Array.isArray(config.channels) ? config.channels : [];
-    const channels = persistedChannels
-        .filter((channel) => !isLegacyGrsaiBrowserChannel(channel))
-        .filter((channel) => !(channel.id === "default" && !channel.apiKey.trim() && (channel.baseUrl === OPENAI_BASE_URL || channel.baseUrl === defaultConfig.baseUrl)))
-        .map((channel, index) => {
-            const migrated = migratePdhlzyGeminiImageChannel(migrateLegacyFastBananaChannel(channel));
-            return createModelChannel({
-                ...migrated,
-                id: migrated.id || (index === 0 ? "default" : `channel-${index + 1}`),
-                name: migrated.name || (index === 0 ? "默认渠道" : `渠道 ${index + 1}`),
-                models: normalizeChannelModels(migrated.models),
-            });
-        });
-    if (!channels.length) {
-        channels.push(
-            createModelChannel({
-                id: "default",
-                name: "默认渠道",
-                baseUrl: config.baseUrl || defaultConfig.baseUrl,
-                apiKey: config.apiKey || "",
-                apiFormat: config.apiFormat || defaultConfig.apiFormat,
-                models: normalizeChannelModels([config.model, config.imageModel, config.videoModel, config.textModel, config.audioModel].map(modelOptionName)),
-            }),
-        );
-    }
-    const systemChannel = localWorkbenchChannel();
-    const systemChannelIndex = channels.findIndex((channel) => channel.id === LOCAL_WORKBENCH_CHANNEL_ID);
-    if (systemChannelIndex >= 0) {
-        channels[systemChannelIndex] = systemChannel;
-    } else {
-        channels.push(systemChannel);
-    }
-    return channels;
+    // 只保留系统工作台渠道：所有图片/视频请求由后端统一代理到 toapis，
+    // 用户不再需要也不应该选择或配置任何中转渠道。
+    void config;
+    return [localWorkbenchChannel()];
 }
 
 /** Apply the same migrations to imported configs and persisted browser configs. */
@@ -462,52 +378,6 @@ export function normalizeAiConfig(persistedConfig: Partial<AiConfig>): AiConfig 
         videoWatermark: config.videoWatermark || "false",
         canvasImageCount: config.canvasImageCount || "3",
     };
-}
-
-function migrateLegacyFastBananaChannel(channel: ModelChannel): ModelChannel {
-    const baseUrl = channel.baseUrl.trim().replace(/\/+$/, "");
-    const wasFixedLocalProxy = channel.id === LEGACY_FAST_BANANA_CHANNEL_ID && channel.apiKey === "local-workbench" && /\/fast$/i.test(baseUrl);
-    if (wasFixedLocalProxy) return directBananaChannel();
-    if (channel.id !== LEGACY_FAST_BANANA_CHANNEL_ID || !isPdhlzyUrl(baseUrl)) return channel;
-    const scriptByModel = new Map(DIRECT_BANANA_MODELS.map((model) => [model.name, model.script]));
-    return {
-        ...channel,
-        models: normalizeChannelModels(channel.models).map((model) => ({ ...model, script: model.script || scriptByModel.get(model.name) })),
-    };
-}
-
-/**
- * pdhlzy exposes Gemini image models through its OpenAI-compatible chat endpoint,
- * not Google's native v1beta generateContent endpoint.  Old imported configs often
- * selected "Gemini" only because the model name begins with gemini; migrate those
- * image-only entries to the working direct-call script without touching the key.
- */
-function migratePdhlzyGeminiImageChannel(channel: ModelChannel): ModelChannel {
-    const models = normalizeChannelModels(channel.models);
-    const hasGeminiImageModel = models.some((model) => model.capability === "image" && /gemini.*image/i.test(model.name));
-    if (channel.apiFormat !== "gemini" || !isPdhlzyUrl(channel.baseUrl) || !hasGeminiImageModel) return channel;
-    return {
-        ...channel,
-        apiFormat: "openai",
-        models: models.map((model) => (model.capability === "image" && /gemini.*image/i.test(model.name) && !model.script ? { ...model, script: DIRECT_BANANA_SCRIPT } : model)),
-    };
-}
-
-function isPdhlzyUrl(baseUrl: string) {
-    try {
-        return new URL(baseUrl).hostname.toLowerCase() === "pdhlzy.com";
-    } catch {
-        return false;
-    }
-}
-
-function isLegacyGrsaiBrowserChannel(channel: ModelChannel) {
-    if (channel.id === LOCAL_WORKBENCH_CHANNEL_ID || channel.id === LEGACY_FAST_BANANA_CHANNEL_ID) return false;
-    try {
-        return new URL(channel.baseUrl).hostname.toLowerCase() === "grsai.dakka.com.cn";
-    } catch {
-        return channel.baseUrl.toLowerCase().includes("grsai.dakka.com.cn");
-    }
 }
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
