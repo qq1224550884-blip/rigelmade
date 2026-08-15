@@ -35,6 +35,8 @@ DEFAULT_BANANA_BASE_URL = os.getenv("NANO_BANANA_BASE_URL", os.getenv("BANANA_BA
 DEFAULT_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", os.getenv("BANANA_MODEL", "nano-banana-2"))
 DEFAULT_FAST_BANANA_BASE_URL = os.getenv("FAST_BANANA_BASE_URL", "")
 DEFAULT_FAST_BANANA_MODEL = os.getenv("FAST_BANANA_MODEL", "nano-banana-2")
+DEFAULT_TOAPIS_BASE_URL = os.getenv("TOAPIS_BASE_URL", "https://toapis.com")
+DEFAULT_TOAPIS_MODEL = os.getenv("TOAPIS_MODEL", "gpt-image-2")
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_POLL_INTERVAL_SECONDS = 4
 DEFAULT_BANANA_WAIT_SECONDS = max(DEFAULT_TIMEOUT_SECONDS, int(os.getenv("NANO_BANANA_WAIT_SECONDS", "1200")))
@@ -58,12 +60,15 @@ DEFAULT_BANANA_BASE_URL = sanitize_base_url(DEFAULT_BANANA_BASE_URL)
 DEFAULT_BANANA_MODEL = sanitize_model(DEFAULT_BANANA_MODEL)
 DEFAULT_FAST_BANANA_BASE_URL = sanitize_base_url(DEFAULT_FAST_BANANA_BASE_URL)
 DEFAULT_FAST_BANANA_MODEL = sanitize_model(DEFAULT_FAST_BANANA_MODEL)
+DEFAULT_TOAPIS_BASE_URL = sanitize_base_url(DEFAULT_TOAPIS_BASE_URL)
+DEFAULT_TOAPIS_MODEL = sanitize_model(DEFAULT_TOAPIS_MODEL)
 
 
 PROVIDER_LABELS = {
     "gpt": "GPT Image 2",
     "banana": "Nano Banana",
     "banana_fast": "Nano Banana 快速渠道",
+    "toapis": "ToAPIs 中转",
 }
 
 SUPPORTED_IMAGE_MODELS = (
@@ -97,6 +102,8 @@ def sanitize_provider(provider: str) -> str:
         return "banana_fast"
     if value in {"banana", "nano", "nano-banana", "nano_banana", "nanobanana"}:
         return "banana"
+    if value in {"toapis", "to_api", "to-api"}:
+        return "toapis"
     return "gpt"
 
 
@@ -121,6 +128,18 @@ def grsai_upstream_model(model: str) -> str:
     value = sanitize_model(model)
     mapping = {
         "gpt-image-2": "gpt-image-2-2k",
+    }
+    return mapping.get(value, value)
+
+
+def toapis_image_model(model: str) -> str:
+    """Map product-facing model names to toapis model ids."""
+    value = sanitize_model(model)
+    mapping = {
+        "gpt-image-2": "gpt-image-2",
+        "nano-banana-2": "gemini-3.1-flash-image-preview",
+        "nano-banana-pro": "gemini-3-pro-image-preview",
+        "nano-banana-fast": "gemini-3.1-flash-image-preview",
     }
     return mapping.get(value, value)
 
@@ -305,7 +324,10 @@ def fast_banana_aspect_ratio_for_size(size: str) -> str:
 
 
 def provider_for_model(model: str) -> str:
-    return "banana" if "banana" in (model or "").lower() else "gpt"
+    value = (model or "").lower()
+    if "banana" in value:
+        return "banana"
+    return "gpt"
 
 
 def supported_model(model: str) -> str:
@@ -623,6 +645,113 @@ def call_gemini_native(
     }
 
 
+def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str) -> str:
+    """Upload a local image to toapis and return its public URL."""
+    with path.open("rb") as handle:
+        response = requests.post(
+            f"{api_base}/v1/uploads/images",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (path.name, handle, mime or "image/png")},
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+    if response.status_code >= 400:
+        raise response_error(response)
+    data = response.json()
+    url = (data.get("data") or {}).get("url") or data.get("url")
+    if not url:
+        raise RuntimeError("toapis upload returned no image URL.")
+    return str(url)
+
+
+def call_toapis(
+    req: GenerateRequest,
+    prompt: str,
+    input_files: list[dict[str, Any]],
+    api_key: str,
+    base_url: str,
+) -> dict[str, Any]:
+    """Call toapis async image generation (POST task + GET poll)."""
+    api_base = sanitize_base_url(base_url)
+    model = toapis_image_model(req.model or "gpt-image-2")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    # Build payload. toapis accepts http(s) URLs only for image inputs; upload local files first.
+    image_urls: list[str] = []
+    for item in input_files:
+        if item.get("role") == "mask":
+            continue
+        path = Path(item["file"])
+        mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
+        image_urls.append(toapis_upload_image(api_base, api_key, path, mime))
+
+    metadata: dict[str, Any] = {}
+    size = (req.image_size or "1K").strip().upper()
+    if size in {"1K", "2K", "4K"}:
+        metadata["resolution"] = size
+    ratio = req.aspect_ratio if req.aspect_ratio and req.aspect_ratio != "auto" else "1:1"
+    orientation = "landscape" if ratio.split(":")[0] > ratio.split(":")[1] else ("portrait" if ratio.split(":")[0] < ratio.split(":")[1] else "")
+    if orientation:
+        metadata["orientation"] = orientation
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "size": ratio,
+        "n": min(max(req.count, 1), 4),
+        "metadata": metadata,
+    }
+    if image_urls:
+        payload["image_urls"] = image_urls
+
+    create_response = requests.post(
+        f"{api_base}/v1/images/generations",
+        headers=headers,
+        json=payload,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
+    if create_response.status_code >= 400:
+        raise response_error(create_response)
+    created = create_response.json()
+    task_id = created.get("id") or task_id_from_response(created)
+    if not task_id:
+        raise RuntimeError("toapis returned no image task id.")
+
+    deadline = time.time() + DEFAULT_BANANA_WAIT_SECONDS
+    last_data: dict[str, Any] = created
+    while time.time() < deadline:
+        time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
+        poll_response = requests.get(
+            f"{api_base}/v1/images/generations/{task_id}",
+            headers=headers,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if poll_response.status_code >= 400:
+            raise response_error(poll_response)
+        last_data = poll_response.json()
+        status = str(last_data.get("status") or "")
+        if status == "completed":
+            urls: list[str] = []
+            result = last_data.get("result") or {}
+            for item in result.get("data") or []:
+                url = item.get("url") if isinstance(item, dict) else None
+                if url:
+                    urls.append(str(url))
+            if not urls:
+                urls = result_urls(last_data)
+            if urls:
+                return {
+                    "id": task_id,
+                    "model": model,
+                    "status": "succeeded",
+                    "data": [{"url": url} for url in urls],
+                }
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            error = last_data.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise RuntimeError(f"toapis image task failed: {message or status}")
+    raise RuntimeError("toapis image task timed out.")
+
+
 def call_fast_banana_chat(
     req: GenerateRequest,
     prompt: str,
@@ -823,6 +952,8 @@ def _get_pool(provider: str) -> _KeyPool:
                 raw = _env_key(provider, "FAST_BANANA_API_KEY") or RUNTIME_CONFIG.get("fastBananaApiKey", "")
             elif provider == "banana":
                 raw = _env_key(provider, "NANO_BANANA_API_KEY", "BANANA_API_KEY", "GRSAI_BANANA_API_KEY") or RUNTIME_CONFIG.get("bananaApiKey", "")
+            elif provider == "toapis":
+                raw = _env_key(provider, "TOAPIS_API_KEY") or RUNTIME_CONFIG.get("toapisApiKey", "")
             else:
                 raw = _env_key(provider, "GRSAI_API_KEY", "GRSAI_KEY") or RUNTIME_CONFIG.get("apiKey", "")
             _KEY_POOLS[provider] = _KeyPool(provider, raw)
@@ -841,7 +972,7 @@ def report_key_error(provider: str, key_str: str, is_rate_limit: bool) -> None:
 
 
 def key_pool_status() -> dict[str, Any]:
-    return {p: _get_pool(p).snapshot() for p in ("gpt", "banana", "banana_fast")}
+    return {p: _get_pool(p).snapshot() for p in ("gpt", "banana", "banana_fast", "toapis")}
 
 
 def current_base_url(provider: str = "gpt") -> str:
@@ -850,6 +981,8 @@ def current_base_url(provider: str = "gpt") -> str:
         return sanitize_base_url(RUNTIME_CONFIG.get("fastBananaBaseUrl") or DEFAULT_FAST_BANANA_BASE_URL)
     if selected == "banana":
         return sanitize_base_url(RUNTIME_CONFIG.get("bananaBaseUrl") or DEFAULT_BANANA_BASE_URL)
+    if selected == "toapis":
+        return sanitize_base_url(RUNTIME_CONFIG.get("toapisBaseUrl") or DEFAULT_TOAPIS_BASE_URL)
     return sanitize_base_url(RUNTIME_CONFIG.get("baseUrl") or DEFAULT_BASE_URL)
 
 
@@ -859,6 +992,8 @@ def current_model(provider: str = "gpt") -> str:
         return sanitize_model(RUNTIME_CONFIG.get("fastBananaModel") or DEFAULT_FAST_BANANA_MODEL)
     if selected == "banana":
         return sanitize_model(RUNTIME_CONFIG.get("bananaModel") or DEFAULT_BANANA_MODEL)
+    if selected == "toapis":
+        return sanitize_model(RUNTIME_CONFIG.get("toapisModel") or DEFAULT_TOAPIS_MODEL)
     return sanitize_model(RUNTIME_CONFIG.get("model") or DEFAULT_MODEL)
 
 
@@ -942,6 +1077,12 @@ def health() -> dict[str, Any]:
             "hasKey": bool(current_api_key("banana_fast")),
             "baseUrl": current_base_url("banana_fast"),
             "model": current_model("banana_fast"),
+        },
+        "toapis": {
+            "label": PROVIDER_LABELS["toapis"],
+            "hasKey": bool(current_api_key("toapis")),
+            "baseUrl": current_base_url("toapis"),
+            "model": current_model("toapis"),
         },
     }
     return {
@@ -1036,12 +1177,16 @@ def upload_data_url(data_url: str = Form(...), name: str = Form("clipboard.png")
 
 @app.post("/api/generate")
 def generate(req: GenerateRequest) -> dict[str, Any]:
-    # If the caller did not pin a provider, infer it from the model so banana-series
-    # models (nano-banana-2) use the banana channel key/base_url instead of the gpt one.
-    if not (req.provider or "").strip() or sanitize_provider(req.provider) == "gpt":
-        inferred = provider_for_model(req.model or "")
-        if inferred != "gpt":
-            req.provider = inferred
+    # Provider resolution. When TOAPIS_API_KEY is configured it is the active relay:
+    # route every image model through toapis (unless the caller explicitly pinned a
+    # non-default provider). Otherwise infer banana vs gpt by model name.
+    if _env_key("toapis", "TOAPIS_API_KEY") or RUNTIME_CONFIG.get("toapisApiKey", ""):
+        req.provider = "toapis"
+    else:
+        if not (req.provider or "").strip() or sanitize_provider(req.provider) == "gpt":
+            inferred = provider_for_model(req.model or "")
+            if inferred != "gpt":
+                req.provider = inferred
     provider = sanitize_provider(req.provider)
     api_key = current_api_key(provider)
     if not api_key:
@@ -1113,7 +1258,9 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
     (run_path / "request.json").write_text(json.dumps(request_log, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
-        if req.model == "nano-banana-2":
+        if provider == "toapis":
+            api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url)
+        elif req.model == "nano-banana-2":
             api_response = call_gemini_native(req, effective_prompt, saved_inputs, api_key, base_url)
         elif provider == "banana":
             api_response = call_banana_draw(req, effective_prompt, saved_inputs, api_key, base_url)

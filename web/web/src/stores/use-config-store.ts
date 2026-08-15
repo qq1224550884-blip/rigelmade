@@ -78,23 +78,30 @@ const LOCAL_WORKBENCH_MODELS: ChannelModel[] = [
     { name: "nano-banana-fast", capability: "image" },
     { name: "nano-banana-pro", capability: "image" },
 ];
-// pdhlzy 的 Nano Banana 不是 /images/generations 协议：它需要 OpenAI
-// chat/completions、Gemini 上游模型名，以及 google.image_config。脚本公开显示在
-// 渠道编辑器中，用户可根据自己中转站的文档修改；调用时浏览器直接访问中转站。
+// toapis 图片生成是异步协议：POST /v1/images/generations 建任务，GET 轮询查结果。
+// 脚本公开显示在渠道编辑器中，用户可根据自己中转站的文档修改；调用时浏览器直接访问中转站。
 const DIRECT_BANANA_SCRIPT = [
     'const upstreamModel = model === "nano-banana-2" ? "gemini-3.1-flash-image-preview" : model === "nano-banana-pro" ? "gemini-3-pro-image-preview" : model;',
-    'const imageSize = params.quality === "high" ? "4K" : params.quality === "medium" ? "2K" : "1K";',
-    'const ratios = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9", "1:8", "8:1", "1:4", "4:1"];',
+    'const resolution = params.quality === "high" ? "4K" : params.quality === "medium" ? "2K" : "1K";',
     'const match = String(params.size || "").match(/^(\\d+)x(\\d+)$/i);',
     'const target = match ? Number(match[1]) / Number(match[2]) : 1;',
-    'const aspectRatio = ratios.reduce((best, value) => { const [w, h] = value.split(":").map(Number); const [bw, bh] = best.split(":").map(Number); return Math.abs(w / h - target) < Math.abs(bw / bh - target) ? value : best; }, "1:1");',
-    'const content = [{ type: "text", text: prompt }, ...images.map((url) => ({ type: "image_url", image_url: { url } }))];',
-    'const data = await request({ method: "post", url: `${baseUrl}/v1/chat/completions`, headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, data: { model: upstreamModel, messages: [{ role: "user", content }], stream: false, extra_body: { google: { image_config: { image_size: imageSize, aspect_ratio: aspectRatio } } } } });',
-    'const source = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.message ?? data;',
-    'const urls = []; const seen = new Set();',
-    'const add = (value) => { if (typeof value !== "string") return; for (const item of value.matchAll(/data:image\\/[-\\w.+]+;base64,[A-Za-z0-9+/=\\r\\n]+|https?:\\/\\/[^\\s)\\]"\'<>,]+/g)) { const url = item[0].replace(/[.,]+$/, ""); if (!seen.has(url)) { seen.add(url); urls.push(url); } } };',
-    'const walk = (value) => { if (typeof value === "string") { add(value); return; } if (Array.isArray(value)) { value.forEach(walk); return; } if (value && typeof value === "object") Object.values(value).forEach(walk); };',
-    'walk(source); if (!urls.length) throw new Error("中转站没有返回图片数据"); return urls;',
+    'const ratios = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];',
+    'const size = ratios.reduce((best, value) => { const [w, h] = value.split(":").map(Number); const [bw, bh] = best.split(":").map(Number); return Math.abs(w / h - target) < Math.abs(bw / bh - target) ? value : best; }, "1:1");',
+    'const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };',
+    'const payload = { model: upstreamModel, prompt, size, n: 1, metadata: { resolution } };',
+    'const created = await request({ method: "post", url: `${baseUrl}/v1/images/generations`, headers, data: payload });',
+    'const taskId = created.id || created.data?.id || created.task_id;',
+    'if (!taskId) throw new Error("中转站没有返回任务 ID");',
+    'let result = null;',
+    'for (let i = 0; i < 30; i += 1) {',
+    '  await new Promise((resolve) => setTimeout(resolve, 4000));',
+    '  result = await request({ method: "get", url: `${baseUrl}/v1/images/generations/${encodeURIComponent(taskId)}`, headers });',
+    '  if (result.status === "completed") break;',
+    '  if (result.status === "failed") throw new Error(result.error?.message || "图片生成失败");',
+    '}',
+    'const data = result?.result?.data || result?.data || [];',
+    'const urls = data.map((item) => item.url).filter(Boolean);',
+    'if (!urls.length) throw new Error("中转站没有返回图片数据"); return urls;',
 ].join("\n");
 const DIRECT_BANANA_MODELS: ChannelModel[] = [
     { name: "nano-banana-2", capability: "image", script: DIRECT_BANANA_SCRIPT },
@@ -120,7 +127,7 @@ function directBananaChannel(): ModelChannel {
     return {
         id: LEGACY_FAST_BANANA_CHANNEL_ID,
         name: "快速渠道",
-        baseUrl: "https://pdhlzy.com",
+        baseUrl: "https://toapis.com",
         apiKey: "",
         apiFormat: "openai",
         models: DIRECT_BANANA_MODELS.map((model) => ({ ...model })),
