@@ -682,7 +682,8 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
             if existing["status"] == "succeeded" and existing["result_json"]:
                 return json.loads(existing["result_json"])
             raise HTTPException(status_code=409, detail="该生成任务正在处理或刚刚失败，请勿重复提交。")
-        price = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND quality = ? AND active = 1", (request_model.model, request_model.image_size)).fetchone()
+        price_quality = render_core.pricing_quality(request_model.image_size)
+        price = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND quality = ? AND active = 1", (request_model.model, price_quality)).fetchone()
         if price is None:
             raise HTTPException(status_code=503, detail="该模型和画质尚未配置积分价格。")
         output_count = min(max(request_model.count, 1), 4)

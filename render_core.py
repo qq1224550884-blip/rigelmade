@@ -112,6 +112,19 @@ def fast_banana_upstream_model(model: str) -> str:
     return aliases.get(sanitize_model(model), sanitize_model(model))
 
 
+def grsai_upstream_model(model: str) -> str:
+    """Map logical model names to the pdh relay's actual model ids.
+
+    pdh (new-api) exposes gpt-image-2-2k / gpt-image-2-4k, not bare gpt-image-2.
+    Keep the product-facing name stable and translate at request time.
+    """
+    value = sanitize_model(model)
+    mapping = {
+        "gpt-image-2": "gpt-image-2-2k",
+    }
+    return mapping.get(value, value)
+
+
 class GenerateImage(BaseModel):
     id: str = ""
     name: str = ""
@@ -230,6 +243,24 @@ def quality_for_size(image_size: str) -> str:
     return "low"
 
 
+def pricing_quality(image_size: str) -> str:
+    """Map the frontend imageSize/imageQuality value to a price-table quality.
+
+    The frontend sends Gemini-style sizes ("1K"/"2K"/"4K") in imageSize, but the
+    price table keys on quality levels (auto/low/medium/high/standard/hd). Normalize
+    so billing always finds a row instead of returning 503 for "1K".
+    """
+    value = (image_size or "standard").strip().lower()
+    normalized = {
+        "1k": "standard",
+        "2k": "hd",
+        "4k": "high",
+    }
+    if value in normalized:
+        return normalized[value]
+    return value if value in {"auto", "low", "medium", "high", "standard", "hd"} else "standard"
+
+
 def size_for_aspect(aspect_ratio: str) -> str:
     options = {
         "1:1": "1024x1024",
@@ -304,7 +335,7 @@ def openai_generate_request(model: str, prompt: str, n: int, quality: str, size:
 def edit_model_name(model: str) -> str:
     if (model or "").startswith("grok-imagine-image"):
         return "grok-imagine-image-edit"
-    return model or DEFAULT_MODEL
+    return grsai_upstream_model(model) or DEFAULT_MODEL
 
 
 def openai_headers(api_key: str) -> dict[str, str]:
@@ -494,6 +525,102 @@ def chat_image_urls(response: dict[str, Any]) -> list[str]:
             urls.extend(match.group(0) for match in re.finditer(r"data:image/[-\w.+]+;base64,[A-Za-z0-9+/=\r\n]+", part))
             urls.extend(match.group(0).rstrip(".,") for match in re.finditer(r"https?://[^\s\)\]\"'<>]+", part))
     return list(dict.fromkeys(urls))
+
+
+def call_gemini_native(
+    req: GenerateRequest,
+    prompt: str,
+    input_files: list[dict[str, Any]],
+    api_key: str,
+    base_url: str,
+) -> dict[str, Any]:
+    """Call Gemini native generateContent API for nano-banana-2.
+
+    Tries x-goog-api-key first, falls back to Authorization Bearer if 401.
+    """
+    api_base = sanitize_base_url(base_url)
+    model_id = req.model or "nano-banana-2"
+    url = f"{api_base}/v1beta/models/{model_id}:generateContent"
+
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    for item in input_files:
+        if item.get("role") == "mask":
+            continue
+        path = Path(item["file"])
+        mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        parts.append({
+            "inlineData": {
+                "mimeType": mime,
+                "data": data,
+            }
+        })
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts,
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"]
+        },
+    }
+
+    # Try x-goog-api-key first (standard Gemini auth)
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_BANANA_WAIT_SECONDS)
+
+    # If 401, retry with Bearer token (relay-specific auth)
+    if response.status_code == 401:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_BANANA_WAIT_SECONDS)
+
+    if response.status_code >= 400:
+        raise response_error(response)
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:800]}") from exc
+
+    urls: list[str] = []
+    for candidate in data.get("candidates", []):
+        content = candidate.get("content", {})
+        for part in content.get("parts", []):
+            # Check for inlineData (Base64)
+            inline_data = part.get("inlineData") or part.get("inline_data")
+            if inline_data:
+                image_base64 = inline_data.get("data")
+                mime_type = inline_data.get("mimeType") or inline_data.get("mime_type", "image/png")
+                if image_base64:
+                    urls.append(f"data:{mime_type};base64,{image_base64}")
+                continue
+
+            # Check for fileData (URL)
+            file_data = part.get("fileData") or part.get("file_data")
+            if file_data:
+                file_uri = file_data.get("fileUri") or file_data.get("file_uri")
+                if file_uri and file_uri.startswith(("http://", "https://")):
+                    urls.append(file_uri)
+
+    if not urls:
+        raise RuntimeError("Gemini native API returned no image data.")
+
+    return {
+        "id": data.get("id", ""),
+        "model": model_id,
+        "status": "succeeded",
+        "data": [{"url": url} for url in urls],
+    }
 
 
 def call_fast_banana_chat(
@@ -744,7 +871,7 @@ def call_grsai(
 ) -> dict[str, Any]:
     api_base = normalized_api_base(base_url)
     common = {
-        "model": req.model or DEFAULT_MODEL,
+        "model": grsai_upstream_model(req.model or DEFAULT_MODEL),
         "prompt": prompt,
         "n": min(max(req.count, 1), 4),
         "quality": quality_for_size(req.image_size),
@@ -909,6 +1036,12 @@ def upload_data_url(data_url: str = Form(...), name: str = Form("clipboard.png")
 
 @app.post("/api/generate")
 def generate(req: GenerateRequest) -> dict[str, Any]:
+    # If the caller did not pin a provider, infer it from the model so banana-series
+    # models (nano-banana-2) use the banana channel key/base_url instead of the gpt one.
+    if not (req.provider or "").strip() or sanitize_provider(req.provider) == "gpt":
+        inferred = provider_for_model(req.model or "")
+        if inferred != "gpt":
+            req.provider = inferred
     provider = sanitize_provider(req.provider)
     api_key = current_api_key(provider)
     if not api_key:
@@ -980,7 +1113,9 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
     (run_path / "request.json").write_text(json.dumps(request_log, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
-        if provider == "banana":
+        if req.model == "nano-banana-2":
+            api_response = call_gemini_native(req, effective_prompt, saved_inputs, api_key, base_url)
+        elif provider == "banana":
             api_response = call_banana_draw(req, effective_prompt, saved_inputs, api_key, base_url)
         elif provider == "banana_fast":
             api_response = call_fast_banana_chat(req, effective_prompt, saved_inputs, api_key, base_url)
