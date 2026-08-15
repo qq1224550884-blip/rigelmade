@@ -134,7 +134,6 @@ export const defaultConfig: AiConfig = {
     apiFormat: "openai",
     channels: [
         localWorkbenchChannel(),
-        directBananaChannel(),
     ],
     model: "grsai-default::gpt-image-2",
     imageModel: "grsai-default::gpt-image-2",
@@ -156,8 +155,6 @@ export const defaultConfig: AiConfig = {
         "grsai-default::nano-banana-2",
         "grsai-default::nano-banana-fast",
         "grsai-default::nano-banana-pro",
-        "banana-fast::nano-banana-2",
-        "banana-fast::nano-banana-pro",
     ],
     quality: "auto",
     size: "1:1",
@@ -424,7 +421,6 @@ function normalizeChannels(config: AiConfig) {
     } else {
         channels.push(systemChannel);
     }
-    if (!channels.some((channel) => channel.id === LEGACY_FAST_BANANA_CHANNEL_ID)) channels.push(directBananaChannel());
     return channels;
 }
 

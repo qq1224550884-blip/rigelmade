@@ -56,8 +56,7 @@ export function AppTopNav() {
                                         WebkitMask: "url(/logo.svg) center / contain no-repeat",
                                     }}
                                 />
-                                <span className="text-base font-medium">AI 效果图</span>
-                                <span className="hidden border-l border-stone-300 pl-2 text-xs font-normal text-stone-500 lg:inline dark:border-stone-700 dark:text-stone-400">商业版</span>
+                                <span className="text-base font-medium">RigelMade 工作台</span>
                             </Link>
 
                             <button

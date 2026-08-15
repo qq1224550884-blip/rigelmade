@@ -38,7 +38,7 @@ export default function AuthPage() {
         <main className="flex min-h-dvh items-center justify-center bg-stone-100 px-5 py-12 dark:bg-stone-950">
             <Card className="w-full max-w-md shadow-sm" styles={{ body: { padding: 30 } }}>
                 <div className="mb-7">
-                    <div className="text-2xl font-semibold text-stone-950 dark:text-stone-100">AI 效果图商业版</div>
+                    <div className="text-2xl font-semibold text-stone-950 dark:text-stone-100">RigelMade 工作台</div>
                     <p className="mt-2 text-sm leading-6 text-stone-500">登录后即可使用生图、画布等全部功能，积分由服务器统一结算。</p>
                 </div>
                 <Tabs

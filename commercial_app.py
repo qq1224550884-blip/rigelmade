@@ -769,12 +769,12 @@ def client_ip(request: Request) -> str:
 
 
 def enforce_login_rate_limit(request: Request, email: str) -> None:
-    """登录防爆破：每 IP 10 次/10 分钟，每邮箱 10 次/15 分钟。"""
+    """登录防爆破：每 IP 30 次/10 分钟，每邮箱 20 次/15 分钟。"""
     ip = client_ip(request)
-    wait_ip = rate_limit.check_rate_limit("login_ip", ip, 10, 600)
+    wait_ip = rate_limit.check_rate_limit("login_ip", ip, 30, 600)
     if wait_ip:
         raise HTTPException(status_code=429, detail=f"尝试过于频繁，请约 {wait_ip} 秒后再试。")
-    wait_email = rate_limit.check_rate_limit("login_email", email, 10, 900)
+    wait_email = rate_limit.check_rate_limit("login_email", email, 20, 900)
     if wait_email:
         raise HTTPException(status_code=429, detail=f"该账号尝试过于频繁，请约 {wait_email} 秒后再试。")
 
