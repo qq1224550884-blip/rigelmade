@@ -87,6 +87,14 @@ def main() -> None:
                        ON CONFLICT(model,quality) DO UPDATE SET credits=excluded.credits,active=excluded.active,updated_at=excluded.updated_at""",
                     (model, quality, credits, 1, timestamp),
                 )
+        # 视频模型：每秒积分单价，计费时 × 时长。
+        for model, by_quality in VIDEO_UNIT_PRICES.items():
+            for quality, credits in by_quality.items():
+                connection.execute(
+                    """INSERT INTO model_prices(model,quality,credits,active,updated_at) VALUES(?,?,?,?,?)
+                       ON CONFLICT(model,quality) DO UPDATE SET credits=excluded.credits,active=excluded.active,updated_at=excluded.updated_at""",
+                    (model, quality, credits, 1, timestamp),
+                )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -94,8 +102,8 @@ def main() -> None:
     finally:
         connection.close()
     image_rows = sum(len(v) for v in QUALITY_TO_RESOLUTION.values())
-    print(f"Commercial pricing seeded: {len(PRODUCTS)} products, {len(IMAGE_PRICES) * len(QUALITY_LEVELS)} image prices.")
-    print(f"Video prices prepared (deferred): {sum(len(v) for v in VIDEO_UNIT_PRICES.values())} rows.")
+    video_rows = sum(len(v) for v in VIDEO_UNIT_PRICES.values())
+    print(f"Commercial pricing seeded: {len(PRODUCTS)} products, {len(IMAGE_PRICES) * len(QUALITY_LEVELS)} image prices, {video_rows} video prices.")
 
 
 if __name__ == "__main__":

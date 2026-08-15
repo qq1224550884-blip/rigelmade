@@ -682,12 +682,27 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
             if existing["status"] == "succeeded" and existing["result_json"]:
                 return json.loads(existing["result_json"])
             raise HTTPException(status_code=409, detail="该生成任务正在处理或刚刚失败，请勿重复提交。")
-        price_quality = render_core.pricing_quality(request_model.image_size)
-        price = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND quality = ? AND active = 1", (request_model.model, price_quality)).fetchone()
-        if price is None:
-            raise HTTPException(status_code=503, detail="该模型和画质尚未配置积分价格。")
-        output_count = min(max(request_model.count, 1), 4)
-        credits = int(price["credits"]) * output_count
+        is_video = render_core.is_video_model(request_model.model)
+        if is_video:
+            # 视频按秒×时长计费：price.credits 存每秒积分，duration 秒数。
+            video_quality = (request_model.video_quality or "720p").strip().lower()
+            quality_aliases = {
+                "480p": "480p", "720p": "720p", "1080p": "1080p",
+                "2k": "2K", "high": "2K", "hd": "720p", "low": "480p",
+            }
+            price_quality = quality_aliases.get(video_quality, "720p")
+            price = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND quality = ? AND active = 1", (request_model.model, price_quality)).fetchone()
+            if price is None:
+                raise HTTPException(status_code=503, detail="该视频模型和画质尚未配置积分价格。")
+            duration = max(1, min(int(request_model.duration or 5), 15))
+            credits = int(price["credits"]) * duration
+        else:
+            price_quality = render_core.pricing_quality(request_model.image_size)
+            price = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND quality = ? AND active = 1", (request_model.model, price_quality)).fetchone()
+            if price is None:
+                raise HTTPException(status_code=503, detail="该模型和画质尚未配置积分价格。")
+            output_count = min(max(request_model.count, 1), 4)
+            credits = int(price["credits"]) * output_count
         if user_balance(connection, user["id"]) < credits:
             raise HTTPException(status_code=402, detail="积分不足，请先充值。")
         job_id = uuid.uuid4().hex
@@ -757,6 +772,73 @@ async def commercial_image_edits(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = commercial_generate(req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
     return openai_image_result(result)
+
+
+@app.post("/v1/videos")
+async def commercial_video_generations(
+    req: Request,
+    model: str = Form(""),
+    prompt: str = Form(""),
+    seconds: str = Form("5"),
+    size: str = Form("1280x720"),
+    resolution_name: str = Form("720p"),
+    input_reference: list[UploadFile] = File(default=[]),
+    x_idempotency_key: str | None = Header(default=None),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    if not model.strip():
+        raise HTTPException(status_code=400, detail="缺少视频模型。")
+    images: list[render_core.GenerateImage] = []
+    for index, upload in enumerate(input_reference, start=1):
+        mime = upload.content_type or "image/png"
+        if not mime.startswith("image/"):
+            raise HTTPException(status_code=400, detail="视频参考图必须是图片。")
+        raw = await upload.read()
+        images.append(render_core.GenerateImage(name=upload.filename or f"ref-{index}.png", role="main" if index == 1 else "reference", dataUrl=f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"))
+    try:
+        duration = max(1, min(int(float(seconds or "5")), 15))
+    except (TypeError, ValueError):
+        duration = 5
+    request_model = render_core.GenerateRequest(
+        provider="toapis",
+        model=model.strip(),
+        prompt=prompt,
+        duration=duration,
+        videoQuality=resolution_name or "720p",
+        aspectRatio="16:9",
+        count=1,
+        images=images,
+    )
+    result = commercial_generate(req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
+    return openai_video_result(result)
+
+
+@app.get("/v1/videos/{task_id}")
+def commercial_video_status(task_id: str, req: Request, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+    del task_id, req
+    # 视频生成是同步完成的：前端 create 后立即轮询，这里直接返回已完成状态。
+    # 真实任务状态由 render_jobs 表记录；前端拿到 video_url 即视为完成。
+    return {"id": task_id, "object": "video", "status": "completed"}
+
+
+def openai_video_result(result: dict[str, Any]) -> dict[str, Any]:
+    run_id = str(result.get("runId") or "")
+    video_url = ""
+    for output in result.get("outputs") or []:
+        name = Path(str(output.get("name") or "")).name
+        path = render_core.RUN_DIR / run_id / "outputs" / name
+        if path.is_file():
+            video_url = f"/data/runs/{run_id}/outputs/{name}"
+            break
+    if not video_url:
+        # 回退到远端 URL
+        for url in result.get("remoteUrls") or []:
+            if isinstance(url, str) and url.startswith(("https://", "http://")):
+                video_url = url
+                break
+    if not video_url:
+        raise HTTPException(status_code=502, detail=result.get("message") or "视频服务没有返回视频。")
+    return {"created": now(), "id": f"video_{run_id}", "status": "completed", "video_url": video_url, "result_url": video_url, "url": video_url, "runId": run_id}
 
 
 def client_ip(request: Request) -> str:

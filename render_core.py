@@ -76,6 +76,10 @@ SUPPORTED_IMAGE_MODELS = (
     "nano-banana-2",
     "nano-banana-fast",
     "nano-banana-pro",
+    "grok-video-1.5",
+    "seedance-2-fast",
+    "seedance-2",
+    "MiniMax-H3",
 )
 
 FAST_BANANA_ASPECT_RATIOS = (
@@ -163,6 +167,8 @@ class GenerateRequest(BaseModel):
     count: int = 1
     images: list[GenerateImage] = Field(default_factory=list)
     requested_size: str = Field(default="", alias="requestedSize")
+    duration: int = Field(default=5, alias="duration")
+    video_quality: str = Field(default="720p", alias="videoQuality")
 
 
 class OpenAIImageGenerationRequest(BaseModel):
@@ -328,6 +334,11 @@ def provider_for_model(model: str) -> str:
     if "banana" in value:
         return "banana"
     return "gpt"
+
+
+def is_video_model(model: str) -> bool:
+    value = (model or "").lower()
+    return any(key in value for key in ("grok-video", "seedance", "minimax", "veo", "kling", "vidu", "sora"))
 
 
 def supported_model(model: str) -> str:
@@ -750,6 +761,129 @@ def call_toapis(
             message = error.get("message") if isinstance(error, dict) else str(error)
             raise RuntimeError(f"toapis image task failed: {message or status}")
     raise RuntimeError("toapis image task timed out.")
+
+
+def toapis_video_model(model: str) -> str:
+    """Map product-facing video model names to toapis model ids."""
+    value = sanitize_model(model)
+    mapping = {
+        "grok-video-1.5": "grok-video-1.5",
+        "seedance-2-fast": "seedance-2-fast",
+        "seedance-2": "seedance-2",
+        "MiniMax-H3": "MiniMax-H3",
+        "minimax-h3": "MiniMax-H3",
+    }
+    return mapping.get(value, value)
+
+
+def toapis_video_aspect_ratio(ratio: str) -> str:
+    value = (ratio or "").strip()
+    if value in {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}:
+        return value
+    return "16:9"
+
+
+def call_toapis_video(
+    req: GenerateRequest,
+    prompt: str,
+    input_files: list[dict[str, Any]],
+    api_key: str,
+    base_url: str,
+) -> dict[str, Any]:
+    """Call toapis async video generation (POST task + GET poll)."""
+    api_base = sanitize_base_url(base_url)
+    model = toapis_video_model(req.model or "grok-video-1.5")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    duration = max(1, min(int(req.duration or 5), 15))
+    quality = (req.video_quality or "720p").strip().lower()
+    aspect_ratio = toapis_video_aspect_ratio(req.aspect_ratio)
+
+    # Build payload per model family. grok-video requires exactly 1 image (image-to-video).
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "duration": duration,
+        "aspect_ratio": aspect_ratio,
+    }
+
+    image_urls: list[str] = []
+    for item in input_files:
+        if item.get("role") == "mask":
+            continue
+        path = Path(item["file"])
+        mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
+        image_urls.append(toapis_upload_image(api_base, api_key, path, mime))
+
+    lower_model = model.lower()
+    if "grok-video" in lower_model:
+        # grok-video-1.5: exactly 1 first-frame image; resolution 480p/720p.
+        if not image_urls:
+            raise RuntimeError("grok-video-1.5 需要一张首帧图作为图生视频输入。")
+        payload["image"] = image_urls[0]
+        payload["resolution"] = quality if quality in {"480p", "720p"} else "720p"
+    elif "seedance" in lower_model:
+        # seedance-2 / seedance-2-fast: image_with_roles, generate_audio.
+        payload["resolution"] = quality if quality in {"480p", "720p", "1080p"} else "720p"
+        payload["generate_audio"] = True
+        if image_urls:
+            payload["image_with_roles"] = [
+                {"url": url, "role": "first_frame" if index == 0 else "reference_image"}
+                for index, url in enumerate(image_urls[:9])
+            ]
+    else:
+        # MiniMax-H3: image_urls compat mode; resolution 2K/768p.
+        payload["resolution"] = "2K" if quality in {"2k", "high", "1080p"} else "768p"
+        if image_urls:
+            payload["image_urls"] = image_urls[:9]
+
+    create_response = requests.post(
+        f"{api_base}/v1/videos/generations",
+        headers=headers,
+        json=payload,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
+    if create_response.status_code >= 400:
+        raise response_error(create_response)
+    created = create_response.json()
+    task_id = created.get("id") or task_id_from_response(created)
+    if not task_id:
+        raise RuntimeError("toapis returned no video task id.")
+
+    deadline = time.time() + DEFAULT_BANANA_WAIT_SECONDS
+    last_data: dict[str, Any] = created
+    while time.time() < deadline:
+        time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
+        poll_response = requests.get(
+            f"{api_base}/v1/videos/generations/{task_id}",
+            headers=headers,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if poll_response.status_code >= 400:
+            raise response_error(poll_response)
+        last_data = poll_response.json()
+        status = str(last_data.get("status") or "")
+        if status == "completed":
+            urls: list[str] = []
+            result = last_data.get("result") or {}
+            for item in result.get("data") or []:
+                url = item.get("url") if isinstance(item, dict) else None
+                if url:
+                    urls.append(str(url))
+            if not urls:
+                urls = result_urls(last_data)
+            if urls:
+                return {
+                    "id": task_id,
+                    "model": model,
+                    "status": "succeeded",
+                    "data": [{"url": url} for url in urls],
+                }
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            error = last_data.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise RuntimeError(f"toapis video task failed: {message or status}")
+    raise RuntimeError("toapis video task timed out.")
 
 
 def call_fast_banana_chat(
@@ -1259,7 +1393,10 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
 
     try:
         if provider == "toapis":
-            api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url)
+            if is_video_model(req.model or ""):
+                api_response = call_toapis_video(req, effective_prompt, saved_inputs, api_key, base_url)
+            else:
+                api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url)
         elif req.model == "nano-banana-2":
             api_response = call_gemini_native(req, effective_prompt, saved_inputs, api_key, base_url)
         elif provider == "banana":
@@ -1289,8 +1426,12 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"inline image {index}: {exc}")
                 continue
-            suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
-            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            parsed_suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+            if is_video_model(req.model or ""):
+                suffix = parsed_suffix if parsed_suffix in {".mp4", ".webm", ".mov"} else ".mp4"
+            elif parsed_suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+                suffix = parsed_suffix
+            else:
                 suffix = ".png"
             target = output_path / f"{run_id}-{index:02d}{suffix}"
             try:

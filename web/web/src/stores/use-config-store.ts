@@ -77,6 +77,10 @@ const LOCAL_WORKBENCH_MODELS: ChannelModel[] = [
     { name: "nano-banana-2", capability: "image" },
     { name: "nano-banana-fast", capability: "image" },
     { name: "nano-banana-pro", capability: "image" },
+    { name: "grok-video-1.5", capability: "video" },
+    { name: "seedance-2-fast", capability: "video" },
+    { name: "seedance-2", capability: "video" },
+    { name: "MiniMax-H3", capability: "video" },
 ];
 // toapis 图片生成是异步协议：POST /v1/images/generations 建任务，GET 轮询查结果。
 // 脚本公开显示在渠道编辑器中，用户可根据自己中转站的文档修改；调用时浏览器直接访问中转站。
@@ -192,7 +196,7 @@ type ConfigStore = {
     clearPromptContinue: () => void;
 };
 
-const VIDEO_KEYWORDS = ["seedance", "video", "sora", "veo", "kling", "wan", "hailuo"];
+const VIDEO_KEYWORDS = ["seedance", "video", "sora", "veo", "kling", "wan", "hailuo", "grok-video", "minimax"];
 const AUDIO_KEYWORDS = ["audio", "tts", "speech", "voice", "music", "sound"];
 const IMAGE_KEYWORDS = ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "banana", "flux", "sdxl", "stable-diffusion", "midjourney"];
 
