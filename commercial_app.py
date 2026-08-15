@@ -689,9 +689,14 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
             quality_aliases = {
                 "480p": "480p", "720p": "720p", "1080p": "1080p",
                 "2k": "2K", "high": "2K", "hd": "720p", "low": "480p",
+                "480": "480p", "720": "720p", "1080": "1080p",
             }
             price_quality = quality_aliases.get(video_quality, "720p")
             price = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND quality = ? AND active = 1", (request_model.model, price_quality)).fetchone()
+            if price is None:
+                # 该模型没有对应清晰度档时，回退到模型任一一档（如 MiniMax-H3 只有 2K）。
+                fallback = connection.execute("SELECT credits FROM model_prices WHERE model = ? AND active = 1 ORDER BY rowid LIMIT 1", (request_model.model,)).fetchone()
+                price = fallback
             if price is None:
                 raise HTTPException(status_code=503, detail="该视频模型和画质尚未配置积分价格。")
             duration = max(1, min(int(request_model.duration or 5), 15))

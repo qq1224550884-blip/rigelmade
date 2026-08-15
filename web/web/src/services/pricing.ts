@@ -24,6 +24,9 @@ const VIDEO_QUALITY_TO_PRICE_KEY: Record<string, string> = {
     "720p": "720p",
     "1080p": "1080p",
     "2k": "2K",
+    "720": "720p",
+    "480": "480p",
+    "1080": "1080p",
     low: "480p",
     medium: "720p",
     high: "2K",
@@ -77,7 +80,15 @@ export function usePricing() {
     const estimateVideoCredits = useCallback(
         (model: string, videoQuality: string, duration: number) => {
             const priceKey = VIDEO_QUALITY_TO_PRICE_KEY[(videoQuality || "720p").toLowerCase()] || "720p";
-            const perSecond = table[model]?.[priceKey];
+            let perSecond: number | null = table[model]?.[priceKey] ?? null;
+            // 该模型没有对应清晰度档时，回退到模型任一一档（如 MiniMax-H3 只有 2K）。
+            if (perSecond == null) {
+                const modelRows = table[model];
+                if (modelRows) {
+                    const fallback = Object.values(modelRows).find((value) => typeof value === "number");
+                    perSecond = typeof fallback === "number" ? fallback : null;
+                }
+            }
             if (perSecond == null) return null;
             const seconds = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(duration)) || 5)));
             return perSecond * seconds;

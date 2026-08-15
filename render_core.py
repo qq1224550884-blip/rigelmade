@@ -832,8 +832,8 @@ def call_toapis_video(
                 for index, url in enumerate(image_urls[:9])
             ]
     else:
-        # MiniMax-H3: image_urls compat mode; resolution 2K/768p.
-        payload["resolution"] = "2K" if quality in {"2k", "high", "1080p"} else "768p"
+        # MiniMax-H3: image_urls compat mode; resolution 2K/768p. 默认 2K（与价格表 2K 档一致）。
+        payload["resolution"] = "2K" if quality in {"2k", "high", "1080p", "720", "720p"} else "768p"
         if image_urls:
             payload["image_urls"] = image_urls[:9]
 
