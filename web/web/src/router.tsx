@@ -2,6 +2,7 @@ import { createBrowserRouter, Navigate, Outlet, useLocation } from "react-router
 import type { ReactNode } from "react";
 
 import { AnalyticsTracker } from "@/components/layout/analytics-tracker";
+import { AppConfigPanel } from "@/components/layout/app-config-modal";
 import UserLayout from "@/layouts/user-layout";
 import AssetsPage from "@/pages/assets";
 import CanvasPage from "@/pages/canvas";
@@ -42,6 +43,7 @@ export const router = createBrowserRouter([
             { path: "/canvas/:id", element: <CanvasProjectPage /> },
             { path: "/billing", element: <BillingPage /> },
             { path: "/admin", element: <AdminPage /> },
+            { path: "/config", element: <AppConfigPanel showDoneButton /> },
         ],
     },
     { path: "/login", element: <AuthPage /> },
