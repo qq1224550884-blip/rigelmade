@@ -3,8 +3,21 @@ export type IndexedDbDatabaseUsage = { name: string; version: number; bytes: num
 export type LocalStorageUsage = { usage: number; quota: number; contentBytes: number; databases: IndexedDbDatabaseUsage[] };
 
 export async function readLocalStorageUsage(): Promise<LocalStorageUsage> {
-    const [estimate, database] = await Promise.all([navigator.storage.estimate(), readDatabaseUsage("infinite-canvas")]);
-    return { usage: estimate.usage!, quota: estimate.quota!, contentBytes: database.bytes, databases: [database] };
+    const database = await readDatabaseUsage("infinite-canvas");
+    // navigator.storage.estimate() 仅在 https 或 localhost 下可用；http 环境降级为仅显示 IndexedDB 内容占用。
+    let usage = 0;
+    let quota = 0;
+    if (navigator.storage?.estimate) {
+        try {
+            const estimate = await navigator.storage.estimate();
+            usage = estimate.usage ?? 0;
+            quota = estimate.quota ?? 0;
+        } catch {
+            usage = 0;
+            quota = 0;
+        }
+    }
+    return { usage, quota, contentBytes: database.bytes, databases: [database] };
 }
 
 function readDatabaseUsage(name: string) {

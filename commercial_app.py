@@ -369,6 +369,7 @@ def health() -> dict[str, Any]:
 
 @app.post("/api/auth/register")
 def register(request: Request, payload: RegisterPayload) -> dict[str, Any]:
+    request.state.email = payload.email.strip().lower()
     enforce_register_rate_limit(request)
     email = payload.email.strip().lower()
     name = payload.display_name.strip()
@@ -868,11 +869,16 @@ def enforce_login_rate_limit(request: Request, email: str) -> None:
 
 
 def enforce_register_rate_limit(request: Request) -> None:
-    """注册防滥用：每 IP 5 次/小时。"""
+    """注册防滥用：每 IP 3 次/小时，同一邮箱 2 次/小时，防止批量注册刷欢迎积分。"""
     ip = client_ip(request)
-    wait = rate_limit.check_rate_limit("register_ip", ip, 5, 3600)
-    if wait:
-        raise HTTPException(status_code=429, detail=f"注册过于频繁，请约 {wait} 秒后再试。")
+    wait_ip = rate_limit.check_rate_limit("register_ip", ip, 3, 3600)
+    if wait_ip:
+        raise HTTPException(status_code=429, detail=f"注册过于频繁，请约 {wait_ip} 秒后再试。")
+    email = request.state.email.lower() if hasattr(request.state, "email") else ""
+    if email:
+        wait_email = rate_limit.check_rate_limit("register_email", email, 2, 3600)
+        if wait_email:
+            raise HTTPException(status_code=429, detail=f"该邮箱注册过于频繁，请约 {wait_email} 秒后再试。")
 
 
 def enforce_generation_rate_limit(request: Request, user_id: str) -> None:

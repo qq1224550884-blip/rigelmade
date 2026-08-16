@@ -39,7 +39,7 @@ export function ConfigLocalStorage({ active }: { active: boolean }) {
     }, [active, refresh, usage]);
 
     const indexedDbBytes = usage?.contentBytes ?? 0;
-    const percent = usage ? Math.min(100, (usage.usage / usage.quota) * 100) : 0;
+    const percent = usage && usage.quota > 0 ? Math.min(100, (usage.usage / usage.quota) * 100) : 0;
 
     return (
         <div className="space-y-3">
