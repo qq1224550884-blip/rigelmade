@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { ModelPicker } from "@/components/model-picker";
 import { ChannelEditorDrawer } from "@/components/layout/channel-editor-drawer";
+import { ConfigLocalStorage } from "@/components/layout/config-local-storage";
 import { ConfigPromptSources } from "@/components/layout/config-prompt-sources";
 import { exportAppConfig, importAppConfig } from "@/services/config-file";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
@@ -314,6 +315,11 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                 </section>
                             </Form>
                         ),
+                    },
+                    {
+                        key: "local-storage",
+                        label: "本地存储",
+                        children: <ConfigLocalStorage active={activeTab === "local-storage"} />,
                     },
                 ]}
             />
