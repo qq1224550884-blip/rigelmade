@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import rate_limit
@@ -56,6 +57,8 @@ render_core.ASSET_DIR.mkdir(parents=True, exist_ok=True)
 render_core.RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI Render Commercial", version="0.1.0")
+# 生成结果存放在 render-data，仅公开该目录。
+app.mount("/data", StaticFiles(directory=str(render_core.DATA_DIR)), name="render-data")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[item.strip() for item in os.getenv("COMMERCIAL_CORS_ORIGINS", "http://127.0.0.1:3002,http://localhost:3002").split(",") if item.strip()],

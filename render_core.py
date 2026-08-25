@@ -37,9 +37,12 @@ DEFAULT_FAST_BANANA_BASE_URL = os.getenv("FAST_BANANA_BASE_URL", "")
 DEFAULT_FAST_BANANA_MODEL = os.getenv("FAST_BANANA_MODEL", "nano-banana-2")
 DEFAULT_TOAPIS_BASE_URL = os.getenv("TOAPIS_BASE_URL", "https://toapis.com")
 DEFAULT_TOAPIS_MODEL = os.getenv("TOAPIS_MODEL", "gpt-image-2")
+DEFAULT_TOAPIS_PROXY_URL = os.getenv("TOAPIS_PROXY_URL", "").strip()
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_POLL_INTERVAL_SECONDS = 4
 DEFAULT_BANANA_WAIT_SECONDS = max(DEFAULT_TIMEOUT_SECONDS, int(os.getenv("NANO_BANANA_WAIT_SECONDS", "1200")))
+TOAPIS_IMAGE_RETRY_ATTEMPTS = max(1, int(os.getenv("TOAPIS_IMAGE_RETRY_ATTEMPTS", "3")))
+TOAPIS_IMAGE_RETRY_DELAY_SECONDS = max(1, int(os.getenv("TOAPIS_IMAGE_RETRY_DELAY_SECONDS", "5")))
 
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<data>.+)$", re.DOTALL)
 
@@ -134,6 +137,14 @@ def grsai_upstream_model(model: str) -> str:
         "gpt-image-2": "gpt-image-2-2k",
     }
     return mapping.get(value, value)
+
+
+def toapis_http_client() -> requests.Session:
+    """创建仅供 ToAPIs 使用的 HTTP 客户端，可选专用出站代理。"""
+    client = requests.Session()
+    if DEFAULT_TOAPIS_PROXY_URL:
+        client.proxies.update({"http": DEFAULT_TOAPIS_PROXY_URL, "https": DEFAULT_TOAPIS_PROXY_URL})
+    return client
 
 
 def toapis_image_model(model: str) -> str:
@@ -390,6 +401,12 @@ def response_error(response: requests.Response) -> RuntimeError:
         if message:
             return RuntimeError(f"HTTP {response.status_code}: {message}")
     return RuntimeError(f"HTTP {response.status_code}: {data}")
+
+
+def toapis_retryable_error(error: Any) -> bool:
+    """判断 ToAPIs 是否返回可重试的临时上游拥堵错误。"""
+    text = json.dumps(error, ensure_ascii=False).lower() if isinstance(error, (dict, list)) else str(error).lower()
+    return any(marker in text for marker in ("system under load", "timeout_error", "rate limit", "rate_limit", "temporarily unavailable"))
 
 
 def response_json_or_events(response: requests.Response) -> dict[str, Any]:
@@ -656,10 +673,10 @@ def call_gemini_native(
     }
 
 
-def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str) -> str:
+def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
     """Upload a local image to toapis and return its public URL."""
     with path.open("rb") as handle:
-        response = requests.post(
+        response = client.post(
             f"{api_base}/v1/uploads/images",
             headers={"Authorization": f"Bearer {api_key}"},
             files={"file": (path.name, handle, mime or "image/png")},
@@ -685,6 +702,7 @@ def call_toapis(
     api_base = sanitize_base_url(base_url)
     model = toapis_image_model(req.model or "gpt-image-2")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    client = toapis_http_client()
 
     # Build payload. toapis accepts http(s) URLs only for image inputs; upload local files first.
     image_urls: list[str] = []
@@ -693,7 +711,7 @@ def call_toapis(
             continue
         path = Path(item["file"])
         mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
-        image_urls.append(toapis_upload_image(api_base, api_key, path, mime))
+        image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client))
 
     metadata: dict[str, Any] = {}
     size = (req.image_size or "1K").strip().upper()
@@ -714,53 +732,64 @@ def call_toapis(
     if image_urls:
         payload["image_urls"] = image_urls
 
-    create_response = requests.post(
-        f"{api_base}/v1/images/generations",
-        headers=headers,
-        json=payload,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
-    if create_response.status_code >= 400:
-        raise response_error(create_response)
-    created = create_response.json()
-    task_id = created.get("id") or task_id_from_response(created)
-    if not task_id:
-        raise RuntimeError("toapis returned no image task id.")
-
-    deadline = time.time() + DEFAULT_BANANA_WAIT_SECONDS
-    last_data: dict[str, Any] = created
-    while time.time() < deadline:
-        time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
-        poll_response = requests.get(
-            f"{api_base}/v1/images/generations/{task_id}",
+    last_error = ""
+    for attempt in range(1, TOAPIS_IMAGE_RETRY_ATTEMPTS + 1):
+        create_response = client.post(
+            f"{api_base}/v1/images/generations",
             headers=headers,
+            json=payload,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
-        if poll_response.status_code >= 400:
-            raise response_error(poll_response)
-        last_data = poll_response.json()
-        status = str(last_data.get("status") or "")
-        if status == "completed":
-            urls: list[str] = []
-            result = last_data.get("result") or {}
-            for item in result.get("data") or []:
-                url = item.get("url") if isinstance(item, dict) else None
-                if url:
-                    urls.append(str(url))
-            if not urls:
-                urls = result_urls(last_data)
-            if urls:
-                return {
-                    "id": task_id,
-                    "model": model,
-                    "status": "succeeded",
-                    "data": [{"url": url} for url in urls],
-                }
-        if status in {"failed", "error", "cancelled", "canceled"}:
-            error = last_data.get("error") or {}
-            message = error.get("message") if isinstance(error, dict) else str(error)
-            raise RuntimeError(f"toapis image task failed: {message or status}")
-    raise RuntimeError("toapis image task timed out.")
+        if create_response.status_code >= 400:
+            raise response_error(create_response)
+        created = create_response.json()
+        task_id = created.get("id") or task_id_from_response(created)
+        if not task_id:
+            raise RuntimeError("toapis returned no image task id.")
+
+        deadline = time.time() + DEFAULT_BANANA_WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
+            poll_response = client.get(
+                f"{api_base}/v1/images/generations/{task_id}",
+                headers=headers,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+            if poll_response.status_code >= 400:
+                raise response_error(poll_response)
+            result_data = poll_response.json()
+            status = str(result_data.get("status") or "").lower()
+            if status == "completed":
+                urls: list[str] = []
+                result = result_data.get("result") or {}
+                for item in result.get("data") or []:
+                    url = item.get("url") if isinstance(item, dict) else None
+                    if url:
+                        urls.append(str(url))
+                if not urls:
+                    urls = result_urls(result_data)
+                if urls:
+                    return {
+                        "id": task_id,
+                        "model": model,
+                        "status": "succeeded",
+                        "data": [{"url": url} for url in urls],
+                    }
+                last_error = "toapis image task completed without an image URL."
+                break
+            if status in {"failed", "error", "cancelled", "canceled"}:
+                error = result_data.get("error") or {}
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                last_error = f"toapis image task failed: {message or status}"
+                if not toapis_retryable_error(error):
+                    raise RuntimeError(last_error)
+                break
+        else:
+            last_error = "toapis image task timed out."
+
+        if attempt < TOAPIS_IMAGE_RETRY_ATTEMPTS:
+            time.sleep(TOAPIS_IMAGE_RETRY_DELAY_SECONDS * attempt)
+    raise RuntimeError(f"{last_error} (retried {TOAPIS_IMAGE_RETRY_ATTEMPTS} times)")
 
 
 def toapis_video_model(model: str) -> str:
@@ -794,6 +823,7 @@ def call_toapis_video(
     api_base = sanitize_base_url(base_url)
     model = toapis_video_model(req.model or "grok-video-1.5")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    client = toapis_http_client()
 
     duration = max(1, min(int(req.duration or 5), 15))
     quality = (req.video_quality or "720p").strip().lower()
@@ -813,7 +843,7 @@ def call_toapis_video(
             continue
         path = Path(item["file"])
         mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
-        image_urls.append(toapis_upload_image(api_base, api_key, path, mime))
+        image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client))
 
     lower_model = model.lower()
     if "grok-video" in lower_model:
@@ -837,7 +867,7 @@ def call_toapis_video(
         if image_urls:
             payload["image_urls"] = image_urls[:9]
 
-    create_response = requests.post(
+    create_response = client.post(
         f"{api_base}/v1/videos/generations",
         headers=headers,
         json=payload,
@@ -854,7 +884,7 @@ def call_toapis_video(
     last_data: dict[str, Any] = created
     while time.time() < deadline:
         time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
-        poll_response = requests.get(
+        poll_response = client.get(
             f"{api_base}/v1/videos/generations/{task_id}",
             headers=headers,
             timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -1435,7 +1465,7 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
                 suffix = ".png"
             target = output_path / f"{run_id}-{index:02d}{suffix}"
             try:
-                image_response = requests.get(url, timeout=300)
+                image_response = (toapis_http_client() if provider == "toapis" else requests).get(url, timeout=300)
                 image_response.raise_for_status()
                 target.write_bytes(image_response.content)
                 outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}"})
