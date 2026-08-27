@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import mimetypes
@@ -43,6 +44,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 4
 DEFAULT_BANANA_WAIT_SECONDS = max(DEFAULT_TIMEOUT_SECONDS, int(os.getenv("NANO_BANANA_WAIT_SECONDS", "1200")))
 TOAPIS_IMAGE_RETRY_ATTEMPTS = max(1, int(os.getenv("TOAPIS_IMAGE_RETRY_ATTEMPTS", "3")))
 TOAPIS_IMAGE_RETRY_DELAY_SECONDS = max(1, int(os.getenv("TOAPIS_IMAGE_RETRY_DELAY_SECONDS", "5")))
+TOAPIS_UPLOAD_MAX_BYTES = max(1, int(os.getenv("TOAPIS_UPLOAD_MAX_BYTES", str(10 * 1024 * 1024))))
 
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<data>.+)$", re.DOTALL)
 
@@ -674,12 +676,26 @@ def call_gemini_native(
 
 
 def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
-    """Upload a local image to toapis and return its public URL."""
-    with path.open("rb") as handle:
+    """Upload a local image to toapis and return its public URL.
+
+    ToAPIs 上传上限为 10MB，超限参考图在上传前自动压缩（重编码为 JPEG）。
+    """
+    compressed = compress_upload_image(path, mime)
+    if compressed is None:
+        with path.open("rb") as handle:
+            response = client.post(
+                f"{api_base}/v1/uploads/images",
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": (path.name, handle, mime or "image/png")},
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+    else:
+        buffer, filename, new_mime = compressed
+        buffer.seek(0)  # BytesIO 保存后游标在末尾，直接上传会读到空文件。
         response = client.post(
             f"{api_base}/v1/uploads/images",
             headers={"Authorization": f"Bearer {api_key}"},
-            files={"file": (path.name, handle, mime or "image/png")},
+            files={"file": (filename, buffer, new_mime)},
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
     if response.status_code >= 400:
@@ -689,6 +705,36 @@ def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, clie
     if not url:
         raise RuntimeError("toapis upload returned no image URL.")
     return str(url)
+
+
+def compress_upload_image(path: Path, mime: str) -> tuple[io.BytesIO, str, str] | None:
+    """Return (bytes, filename, mime) when the image must be compressed, else None.
+
+    仅在文件超过 ToAPIs 上传上限时触发；用 Pillow 重编码为 JPEG，
+    先缩放到最长边不超过 2048px，再按需降质量，确保体积落回上限内。
+    """
+    if path.stat().st_size <= TOAPIS_UPLOAD_MAX_BYTES:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("参考图超过 10MB 且服务器缺少压缩组件，请先压缩图片再上传。")
+    try:
+        image = Image.open(path)
+        image.load()
+    except Exception as exc:
+        raise RuntimeError(f"参考图无法读取：{exc}") from exc
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    max_side = 2048
+    if max(image.size) > max_side:
+        image.thumbnail((max_side, max_side), Image.LANCZOS)
+    for quality in (88, 78, 68, 55):
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        if buffer.tell() <= TOAPIS_UPLOAD_MAX_BYTES:
+            return buffer, "upload.jpg", "image/jpeg"
+    raise RuntimeError("参考图压缩后仍超过 10MB，请先缩小图片再上传。")
 
 
 def call_toapis(
