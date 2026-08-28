@@ -786,37 +786,46 @@ async def commercial_image_edits(
 @app.post("/v1/videos")
 async def commercial_video_generations(
     req: Request,
-    model: str = Form(""),
-    prompt: str = Form(""),
-    seconds: str = Form("5"),
-    size: str = Form("1280x720"),
-    resolution_name: str = Form("720p"),
-    input_reference: list[UploadFile] = File(default=[]),
     x_idempotency_key: str | None = Header(default=None),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
-    if not model.strip():
+    form = await req.form()
+    model = str(form.get("model") or "").strip()
+    prompt = str(form.get("prompt") or "")
+    seconds = str(form.get("seconds") or "5")
+    resolution_name = str(form.get("resolution_name") or "720p")
+    if not model:
         raise HTTPException(status_code=400, detail="缺少视频模型。")
     images: list[render_core.GenerateImage] = []
-    for index, upload in enumerate(input_reference, start=1):
+    for index, upload in enumerate(form.getlist("input_reference"), start=1):
         mime = upload.content_type or "image/png"
         if not mime.startswith("image/"):
             raise HTTPException(status_code=400, detail="视频参考图必须是图片。")
         raw = await upload.read()
         images.append(render_core.GenerateImage(name=upload.filename or f"ref-{index}.png", role="main" if index == 1 else "reference", dataUrl=f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"))
+    videos: list[render_core.GenerateImage] = []
+    for index, upload in enumerate(form.getlist("input_video"), start=1):
+        mime = upload.content_type or "video/mp4"
+        if not mime.startswith("video/"):
+            raise HTTPException(status_code=400, detail="参考视频必须是视频文件。")
+        raw = await upload.read()
+        if len(raw) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="参考视频超过 50MB，请压缩后再上传。")
+        videos.append(render_core.GenerateImage(name=upload.filename or f"ref-video-{index}.mp4", role="reference", dataUrl=f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"))
     try:
         duration = max(1, min(int(float(seconds or "5")), 15))
     except (TypeError, ValueError):
         duration = 5
     request_model = render_core.GenerateRequest(
         provider="toapis",
-        model=model.strip(),
+        model=model,
         prompt=prompt,
         duration=duration,
         videoQuality=resolution_name or "720p",
         aspectRatio="16:9",
         count=1,
         images=images,
+        videoInputs=videos,
     )
     result = commercial_generate(req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
     return openai_video_result(result)

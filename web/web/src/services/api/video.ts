@@ -65,10 +65,10 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     if (isSeedanceVideoConfig(requestConfig)) {
         return createSeedanceTask(requestConfig, selectedModel, prompt, references, videoReferences, audioReferences, options);
     }
-    if (videoReferences.length || audioReferences.length) {
-        throw new Error("当前视频接口不支持参考视频或参考音频，请切换到 Seedance 2.0 / 火山 Agent Plan 模型，或移除参考资产");
+    if (audioReferences.length) {
+        throw new Error("当前视频接口不支持参考音频，请切换到 Seedance 2.0 / 火山 Agent Plan 模型，或移除参考音频");
     }
-    return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
+    return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, videoReferences, options);
 }
 
 export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
@@ -132,7 +132,7 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
     throw new Error("视频接口没有返回可播放的视频");
 }
 
-async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], videoReferences: ReferenceVideo[], options?: RequestOptions): Promise<VideoGenerationTask> {
     const body = new FormData();
     body.append("model", modelOptionName(model));
     body.append("prompt", prompt);
@@ -141,7 +141,9 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     body.append("resolution_name", normalizeVideoResolution(config.vquality));
     body.append("preset", "normal");
     const files = await Promise.all(references.slice(0, 7).map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
-    files.forEach((file) => body.append("input_reference[]", file));
+    files.forEach((file) => body.append("input_reference", file));
+    const videoFiles = await Promise.all(videoReferences.slice(0, 3).map((video, index) => videoReferenceToFile(video, index)));
+    videoFiles.forEach((file) => body.append("input_video", file));
     try {
         const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config), signal: options?.signal })).data);
         if (!created.id) throw new Error("视频接口没有返回任务 ID");
@@ -421,4 +423,25 @@ function blobToDataUrl(blob: Blob) {
         reader.onerror = () => reject(new Error("读取本地资产失败"));
         reader.readAsDataURL(blob);
     });
+}
+
+async function videoReferenceToFile(video: ReferenceVideo, index: number): Promise<File> {
+    let blob: Blob | null = null;
+    if (video.storageKey) blob = await getMediaBlob(video.storageKey);
+    if (!blob && video.url?.startsWith("blob:")) {
+        try {
+            blob = await (await fetch(video.url)).blob();
+        } catch {
+            blob = null;
+        }
+    }
+    if (!blob && /^https?:\/\//i.test(video.url || "")) {
+        try {
+            blob = await (await fetch(video.url)).blob();
+        } catch {
+            blob = null;
+        }
+    }
+    if (!blob) throw new Error(`参考视频${index + 1} 无法读取，请重新上传`);
+    return new File([blob], video.name || `ref-video-${index + 1}.mp4`, { type: video.type || "video/mp4" });
 }

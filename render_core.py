@@ -36,7 +36,7 @@ DEFAULT_BANANA_BASE_URL = os.getenv("NANO_BANANA_BASE_URL", os.getenv("BANANA_BA
 DEFAULT_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", os.getenv("BANANA_MODEL", "nano-banana-2"))
 DEFAULT_FAST_BANANA_BASE_URL = os.getenv("FAST_BANANA_BASE_URL", "")
 DEFAULT_FAST_BANANA_MODEL = os.getenv("FAST_BANANA_MODEL", "nano-banana-2")
-DEFAULT_TOAPIS_BASE_URL = os.getenv("TOAPIS_BASE_URL", "https://toapis.com")
+DEFAULT_TOAPIS_BASE_URL = os.getenv("TOAPIS_BASE_URL", "https://toapis.xyz")
 DEFAULT_TOAPIS_MODEL = os.getenv("TOAPIS_MODEL", "gpt-image-2")
 DEFAULT_TOAPIS_PROXY_URL = os.getenv("TOAPIS_PROXY_URL", "").strip()
 DEFAULT_TIMEOUT_SECONDS = 180
@@ -45,6 +45,8 @@ DEFAULT_BANANA_WAIT_SECONDS = max(DEFAULT_TIMEOUT_SECONDS, int(os.getenv("NANO_B
 TOAPIS_IMAGE_RETRY_ATTEMPTS = max(1, int(os.getenv("TOAPIS_IMAGE_RETRY_ATTEMPTS", "3")))
 TOAPIS_IMAGE_RETRY_DELAY_SECONDS = max(1, int(os.getenv("TOAPIS_IMAGE_RETRY_DELAY_SECONDS", "5")))
 TOAPIS_UPLOAD_MAX_BYTES = max(1, int(os.getenv("TOAPIS_UPLOAD_MAX_BYTES", str(10 * 1024 * 1024))))
+# 参考视频生成上游排队可能很久，单独放宽等待时长（秒）。
+TOAPIS_VIDEO_WAIT_SECONDS = max(600, int(os.getenv("TOAPIS_VIDEO_WAIT_SECONDS", "3600")))
 
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<data>.+)$", re.DOTALL)
 
@@ -182,6 +184,7 @@ class GenerateRequest(BaseModel):
     requested_size: str = Field(default="", alias="requestedSize")
     duration: int = Field(default=5, alias="duration")
     video_quality: str = Field(default="720p", alias="videoQuality")
+    videos: list[GenerateImage] = Field(default_factory=list, alias="videoInputs")
 
 
 class OpenAIImageGenerationRequest(BaseModel):
@@ -238,8 +241,8 @@ def data_url_to_bytes(data_url: str) -> tuple[bytes, str]:
     if not match:
         raise ValueError("Not a base64 image data URL.")
     mime = match.group("mime")
-    if not mime.startswith("image/"):
-        raise ValueError("Only image data URLs are supported.")
+    if not (mime.startswith("image/") or mime.startswith("video/")):
+        raise ValueError("Only image or video data URLs are supported.")
     return base64.b64decode(match.group("data")), mime
 
 
@@ -737,6 +740,24 @@ def compress_upload_image(path: Path, mime: str) -> tuple[io.BytesIO, str, str] 
     raise RuntimeError("参考图压缩后仍超过 10MB，请先缩小图片再上传。")
 
 
+def toapis_upload_video(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
+    """Upload a local video to toapis and return its public URL."""
+    with path.open("rb") as handle:
+        response = client.post(
+            f"{api_base}/v1/uploads/videos",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (path.name, handle, mime or "video/mp4")},
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+    if response.status_code >= 400:
+        raise response_error(response)
+    data = response.json()
+    url = (data.get("data") or {}).get("url") or data.get("url")
+    if not url:
+        raise RuntimeError("toapis upload returned no video URL.")
+    return str(url)
+
+
 def call_toapis(
     req: GenerateRequest,
     prompt: str,
@@ -862,10 +883,14 @@ def call_toapis_video(
     req: GenerateRequest,
     prompt: str,
     input_files: list[dict[str, Any]],
+    video_files: list[dict[str, Any]],
     api_key: str,
     base_url: str,
 ) -> dict[str, Any]:
-    """Call toapis async video generation (POST task + GET poll)."""
+    """Call toapis async video generation (POST task + GET poll).
+
+    seedance-2 / MiniMax-H3 支持参考视频（video_with_roles）；grok-video-1.5 仅图生视频。
+    """
     api_base = sanitize_base_url(base_url)
     model = toapis_video_model(req.model or "grok-video-1.5")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -891,26 +916,41 @@ def call_toapis_video(
         mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
         image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client))
 
+    video_urls: list[str] = []
+    for item in video_files:
+        path = Path(item["file"])
+        mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "video/mp4"
+        video_urls.append(toapis_upload_video(api_base, api_key, path, mime, client))
+
     lower_model = model.lower()
     if "grok-video" in lower_model:
-        # grok-video-1.5: exactly 1 first-frame image; resolution 480p/720p.
+        # grok-video-1.5: exactly 1 first-frame image; resolution 480p/720p. 不支持参考视频。
+        if video_urls:
+            raise RuntimeError("grok-video-1.5 不支持参考视频，请改用 Seedance 2 或 MiniMax H3。")
         if not image_urls:
             raise RuntimeError("grok-video-1.5 需要一张首帧图作为图生视频输入。")
         payload["image"] = image_urls[0]
         payload["resolution"] = quality if quality in {"480p", "720p"} else "720p"
     elif "seedance" in lower_model:
-        # seedance-2 / seedance-2-fast: image_with_roles, generate_audio.
+        # seedance-2 / seedance-2-fast: image_with_roles + video_with_roles, generate_audio.
         payload["resolution"] = quality if quality in {"480p", "720p", "1080p"} else "720p"
         payload["generate_audio"] = True
         if image_urls:
+            # 有参考视频时为多模态参考模式，图片一律 reference_image；否则首张为首帧。
             payload["image_with_roles"] = [
-                {"url": url, "role": "first_frame" if index == 0 else "reference_image"}
+                {"url": url, "role": "first_frame" if (index == 0 and not video_urls) else "reference_image"}
                 for index, url in enumerate(image_urls[:9])
             ]
+        if video_urls:
+            payload["video_with_roles"] = [{"url": url, "role": "reference_video"} for url in video_urls]
     else:
-        # MiniMax-H3: image_urls compat mode; resolution 2K/768p. 默认 2K（与价格表 2K 档一致）。
+        # MiniMax-H3: image_with_roles/video_with_roles 多模态参考；无视频时才用 image_urls 兼容模式。
         payload["resolution"] = "2K" if quality in {"2k", "high", "1080p", "720", "720p"} else "768p"
-        if image_urls:
+        if video_urls:
+            if image_urls:
+                payload["image_with_roles"] = [{"url": url, "role": "reference_image"} for url in image_urls[:9]]
+            payload["video_with_roles"] = [{"url": url, "role": "reference_video"} for url in video_urls]
+        elif image_urls:
             payload["image_urls"] = image_urls[:9]
 
     create_response = client.post(
@@ -926,7 +966,7 @@ def call_toapis_video(
     if not task_id:
         raise RuntimeError("toapis returned no video task id.")
 
-    deadline = time.time() + DEFAULT_BANANA_WAIT_SECONDS
+    deadline = time.time() + TOAPIS_VIDEO_WAIT_SECONDS
     last_data: dict[str, Any] = created
     while time.time() < deadline:
         time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
@@ -1425,6 +1465,20 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
             continue
         saved_inputs.append({"id": image.id, "name": image.name, "role": image.role, "file": str(file_path), "mime": mime})
 
+    saved_video_inputs: list[dict[str, Any]] = []
+    for index, video in enumerate(req.videos, start=1):
+        if video.data_url:
+            raw, mime = data_url_to_bytes(video.data_url)
+            suffix = ext_for_mime(mime)
+            file_path = input_path / f"video-{index:02d}-{safe_name(video.name, 'video')}{suffix}"
+            file_path.write_bytes(raw)
+        elif video.url:
+            file_path = local_url_to_path(video.url)
+            mime = mimetypes.guess_type(file_path.name)[0] or "video/mp4"
+        else:
+            continue
+        saved_video_inputs.append({"id": video.id, "name": video.name, "role": video.role, "file": str(file_path), "mime": mime})
+
     effective_prompt = build_prompt(req, provider)
     base_url = current_base_url(provider)
     api_base = draw_api_base(base_url) if provider == "banana" else normalized_api_base(base_url)
@@ -1446,6 +1500,7 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
         "negativePrompt": req.negative_prompt,
         "effectivePrompt": effective_prompt,
         "images": saved_inputs,
+        "videos": saved_video_inputs,
         "baseUrl": base_url,
         "apiBase": api_base,
         "endpoint": endpoint,
@@ -1470,7 +1525,7 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
     try:
         if provider == "toapis":
             if is_video_model(req.model or ""):
-                api_response = call_toapis_video(req, effective_prompt, saved_inputs, api_key, base_url)
+                api_response = call_toapis_video(req, effective_prompt, saved_inputs, saved_video_inputs, api_key, base_url)
             else:
                 api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url)
         elif req.model == "nano-banana-2":
