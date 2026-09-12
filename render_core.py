@@ -8,6 +8,7 @@ import math
 import mimetypes
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -36,9 +37,11 @@ DEFAULT_BANANA_BASE_URL = os.getenv("NANO_BANANA_BASE_URL", os.getenv("BANANA_BA
 DEFAULT_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", os.getenv("BANANA_MODEL", "nano-banana-2"))
 DEFAULT_FAST_BANANA_BASE_URL = os.getenv("FAST_BANANA_BASE_URL", "")
 DEFAULT_FAST_BANANA_MODEL = os.getenv("FAST_BANANA_MODEL", "nano-banana-2")
-DEFAULT_TOAPIS_BASE_URL = os.getenv("TOAPIS_BASE_URL", "https://toapis.xyz")
+DEFAULT_TOAPIS_BASE_URL = os.getenv("TOAPIS_BASE_URL", "https://toapis.cn")
 DEFAULT_TOAPIS_MODEL = os.getenv("TOAPIS_MODEL", "gpt-image-2")
 DEFAULT_TOAPIS_PROXY_URL = os.getenv("TOAPIS_PROXY_URL", "").strip()
+# 备用接入域名：主域名 DNS 解析失败时自动切换，避免域名变更导致全站生图不可用。
+TOAPIS_BASE_URL_FALLBACKS = tuple(item.strip() for item in os.getenv("TOAPIS_BASE_URL_FALLBACKS", "https://toapis.cn,https://api.toapis.cn").split(",") if item.strip())
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_POLL_INTERVAL_SECONDS = 4
 DEFAULT_BANANA_WAIT_SECONDS = max(DEFAULT_TIMEOUT_SECONDS, int(os.getenv("NANO_BANANA_WAIT_SECONDS", "1200")))
@@ -141,6 +144,30 @@ def grsai_upstream_model(model: str) -> str:
         "gpt-image-2": "gpt-image-2-2k",
     }
     return mapping.get(value, value)
+
+
+def resolve_toapis_base_url(base_url: str) -> str:
+    """主域名 DNS 解析失败时自动切到备用域名。
+
+    2026-08-28 toapis.xyz 的 A 记录整体消失导致生图全线失败，这里按顺序探测
+    候选域名，返回第一个能解析的；全部不可解析时返回原值，让请求自己报错。
+    """
+    primary = sanitize_base_url(base_url)
+    candidates = [primary] + [sanitize_base_url(item) for item in TOAPIS_BASE_URL_FALLBACKS]
+    seen: set[str] = set()
+    for url in candidates:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        host = urllib.parse.urlparse(url).hostname
+        if not host:
+            continue
+        try:
+            socket.getaddrinfo(host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            return url
+        except OSError:
+            continue
+    return primary
 
 
 def toapis_http_client() -> requests.Session:
@@ -766,7 +793,7 @@ def call_toapis(
     base_url: str,
 ) -> dict[str, Any]:
     """Call toapis async image generation (POST task + GET poll)."""
-    api_base = sanitize_base_url(base_url)
+    api_base = resolve_toapis_base_url(base_url)
     model = toapis_image_model(req.model or "gpt-image-2")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     client = toapis_http_client()
@@ -891,7 +918,7 @@ def call_toapis_video(
 
     seedance-2 / MiniMax-H3 支持参考视频（video_with_roles）；grok-video-1.5 仅图生视频。
     """
-    api_base = sanitize_base_url(base_url)
+    api_base = resolve_toapis_base_url(base_url)
     model = toapis_video_model(req.model or "grok-video-1.5")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     client = toapis_http_client()
