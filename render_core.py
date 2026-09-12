@@ -178,6 +178,36 @@ def toapis_http_client() -> requests.Session:
     return client
 
 
+# 各 ToAPIs 图片模型支持的宽高比（官方文档取值）。画布会算出非标准比例
+# （如 1824x1024 → 57:32），直接透传会被上游拒绝，必须先吸附到最近的标准比例。
+TOAPIS_IMAGE_RATIOS: dict[str, tuple[str, ...]] = {
+    "gpt-image-2": ("1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21"),
+    "gemini-3.1-flash-image-preview": ("1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "5:4", "4:5", "21:9", "1:4", "4:1", "1:8", "8:1"),
+    "gemini-3-pro-image-preview": ("1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"),
+}
+
+
+def toapis_image_aspect_ratio(model: str, ratio: str) -> str:
+    """把请求宽高比吸附到该模型支持的标准比例，避免上游因非标准比例拒绝任务。"""
+    supported = TOAPIS_IMAGE_RATIOS.get(toapis_image_model(model), TOAPIS_IMAGE_RATIOS["gpt-image-2"])
+    value = (ratio or "").strip()
+    if value in supported:
+        return value
+    match = re.match(r"^(\d+)\s*[:：]\s*(\d+)$", value)
+    if not match:
+        return "1:1"
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        return "1:1"
+    target = width / height
+
+    def distance(item: str) -> float:
+        item_width, item_height = (int(part) for part in item.split(":"))
+        return abs((item_width / item_height) - target)
+
+    return min(supported, key=distance)
+
+
 def toapis_image_model(model: str) -> str:
     """Map product-facing model names to toapis model ids."""
     value = sanitize_model(model)
@@ -811,8 +841,9 @@ def call_toapis(
     size = (req.image_size or "1K").strip().upper()
     if size in {"1K", "2K", "4K"}:
         metadata["resolution"] = size
-    ratio = req.aspect_ratio if req.aspect_ratio and req.aspect_ratio != "auto" else "1:1"
-    orientation = "landscape" if ratio.split(":")[0] > ratio.split(":")[1] else ("portrait" if ratio.split(":")[0] < ratio.split(":")[1] else "")
+    ratio = toapis_image_aspect_ratio(model, req.aspect_ratio if req.aspect_ratio and req.aspect_ratio != "auto" else "1:1")
+    ratio_width, ratio_height = (int(part) for part in ratio.split(":"))
+    orientation = "landscape" if ratio_width > ratio_height else ("portrait" if ratio_width < ratio_height else "")
     if orientation:
         metadata["orientation"] = orientation
 
