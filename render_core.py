@@ -1183,6 +1183,8 @@ def reference_role_plain(role: str) -> str:
 
 # ---- Key pool with auto-rotation -------------------------------------------
 _COOLDOWN_SECONDS = int(os.getenv("KEY_COOLDOWN_SECONDS", "300"))
+# 令牌日额度用尽：不是临时限流，短期内无法恢复，冷却时间要显著更长。
+_QUOTA_COOLDOWN_SECONDS = int(os.getenv("KEY_QUOTA_COOLDOWN_SECONDS", "21600"))
 _KEY_POOLS: dict[str, _KeyPool] = {}
 _KEY_POOL_LOCK = threading.Lock()
 
@@ -1212,7 +1214,7 @@ class _KeyPool:
         self.stats[idx]["calls"] += 1
         return self.keys[idx]
 
-    def mark_error(self, key_str: str, is_rate_limit: bool) -> None:
+    def mark_error(self, key_str: str, is_rate_limit: bool, cooldown_seconds: int | None = None) -> None:
         """If rate-limit, put the key in cooldown. Otherwise just count."""
         if not self.keys:
             return
@@ -1221,7 +1223,7 @@ class _KeyPool:
                 self.stats[i]["errors"] += 1
                 self.stats[i]["last_error"] = "rate_limit" if is_rate_limit else "other"
                 if is_rate_limit:
-                    self.cooldowns[i] = time.monotonic() + _COOLDOWN_SECONDS
+                    self.cooldowns[i] = time.monotonic() + (cooldown_seconds or _COOLDOWN_SECONDS)
                 return
 
     def snapshot(self) -> dict[str, Any]:
@@ -1273,10 +1275,19 @@ def current_api_key(provider: str = "gpt") -> str:
     return _get_pool(selected).pick()
 
 
-def report_key_error(provider: str, key_str: str, is_rate_limit: bool) -> None:
-    """Call after an API error to mark the key (rate-limit keys enter cooldown)."""
+def report_key_error(provider: str, key_str: str, is_rate_limit: bool, quota_exhausted: bool = False) -> None:
+    """Call after an API error to mark the key (rate-limit / quota keys enter cooldown)."""
     selected = sanitize_provider(provider)
-    _get_pool(selected).mark_error(key_str, is_rate_limit)
+    _get_pool(selected).mark_error(key_str, is_rate_limit, _QUOTA_COOLDOWN_SECONDS if quota_exhausted else None)
+
+
+def is_quota_exhausted_error(error_text: str) -> bool:
+    """令牌日额度用尽（区别于临时限流）：短时间内重试无效，需换 Key 或调高限额。"""
+    text = (error_text or "").lower()
+    return "quota" in text and ("403" in text or "daily quota" in text or "exhausted" in text)
+
+
+QUOTA_EXHAUSTED_MESSAGE = "上游渠道今日额度已用完（该 API Key 的每日消费上限），请到中转站后台调高该令牌的每日限额，或更换新的 API Key。"
 
 
 def key_pool_status() -> dict[str, Any]:
@@ -1596,9 +1607,10 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
             api_response = call_grsai(req, effective_prompt, saved_inputs, api_key, base_url)
     except Exception as exc:  # noqa: BLE001
         err_text = str(exc)
-        report_key_error(provider, api_key, "429" in err_text or "rate" in err_text.lower())
+        quota_exhausted = is_quota_exhausted_error(err_text)
+        report_key_error(provider, api_key, quota_exhausted or "429" in err_text or "rate" in err_text.lower(), quota_exhausted)
         (run_path / "error.json").write_text(json.dumps({"error": err_text}, ensure_ascii=False, indent=2), encoding="utf-8")
-        raise HTTPException(status_code=502, detail=err_text) from exc
+        raise HTTPException(status_code=502, detail=QUOTA_EXHAUSTED_MESSAGE if quota_exhausted else err_text) from exc
     (run_path / "response.json").write_text(json.dumps(api_response, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         remote_urls = result_urls(api_response)
