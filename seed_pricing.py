@@ -40,12 +40,13 @@ OBSOLETE_PRODUCT_IDS = (
 )
 # 图片模型定价（积分/张，×1.5 向上取整），键为 model，值为 {resolution: credits}
 IMAGE_PRICES = {
-    "gpt-image-2": {"1K": 5, "2K": 6, "4K": 8},
     "gpt-image-2.5": {"1K": 5, "2K": 6, "4K": 8},
     "nano-banana-2": {"1K": 9, "2K": 12, "4K": 18},
     "nano-banana-fast": {"1K": 9, "2K": 12, "4K": 18},
     "nano-banana-pro": {"1K": 18, "2K": 18, "4K": 18},
 }
+# 已下线图片模型：价格行保留但停用，避免旧模型仍可被下单。
+OBSOLETE_IMAGE_MODELS = ("gpt-image-2",)
 # quality 档位 → 对应分辨率（与 render_core.pricing_quality 映射一致）
 # auto/low/standard 按 1K 计；medium/hd 按 2K 计；high 按 4K 计
 QUALITY_TO_RESOLUTION = {
@@ -89,6 +90,12 @@ def main() -> None:
                        ON CONFLICT(model,quality) DO UPDATE SET credits=excluded.credits,active=excluded.active,updated_at=excluded.updated_at""",
                     (model, quality, credits, 1, timestamp),
                 )
+        # 已下线图片模型：停用历史价格行。
+        for model in OBSOLETE_IMAGE_MODELS:
+            connection.execute(
+                "UPDATE model_prices SET active=0, updated_at=? WHERE model=?",
+                (timestamp, model),
+            )
         # 视频模型：每秒积分单价，计费时 × 时长。
         for model, by_quality in VIDEO_UNIT_PRICES.items():
             for quality, credits in by_quality.items():

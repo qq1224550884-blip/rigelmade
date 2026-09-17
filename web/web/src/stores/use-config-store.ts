@@ -70,7 +70,6 @@ const LOCAL_WORKBENCH_BASE_URL = typeof window === "undefined"
     ? "http://127.0.0.1:8790"
     : window.location.origin;
 const LOCAL_WORKBENCH_MODELS: ChannelModel[] = [
-    { name: "gpt-image-2", capability: "image" },
     { name: "gpt-image-2.5", capability: "image" },
     { name: "nano-banana-2", capability: "image" },
     { name: "nano-banana-fast", capability: "image" },
@@ -103,11 +102,11 @@ export const defaultConfig: AiConfig = {
     channels: [
         localWorkbenchChannel(),
     ],
-    model: "grsai-default::gpt-image-2",
-    imageModel: "grsai-default::gpt-image-2",
-    videoModel: "grsai-default::gpt-image-2",
-    textModel: "grsai-default::gpt-image-2",
-    audioModel: "grsai-default::gpt-image-2",
+    model: "grsai-default::gpt-image-2.5",
+    imageModel: "grsai-default::gpt-image-2.5",
+    videoModel: "grsai-default::gpt-image-2.5",
+    textModel: "grsai-default::gpt-image-2.5",
+    audioModel: "grsai-default::gpt-image-2.5",
     audioVoice: "alloy",
     audioFormat: "mp3",
     audioSpeed: "1",
@@ -119,7 +118,7 @@ export const defaultConfig: AiConfig = {
     systemPrompt: "",
     reasoningEffort: "auto",
     models: [
-        "grsai-default::gpt-image-2",
+        "grsai-default::gpt-image-2.5",
         "grsai-default::nano-banana-2",
         "grsai-default::nano-banana-fast",
         "grsai-default::nano-banana-pro",
@@ -314,6 +313,22 @@ export function modelOptionsFromChannels(channels: ModelChannel[]) {
     return uniqueModelOptions(channels.flatMap((channel) => channel.models.map((model) => encodeChannelModel(channel.id, model.name))));
 }
 
+/** 已下线模型 → 替代模型：老配置里的取值在归一化前先迁移，避免模型变空。 */
+const LEGACY_MODEL_ALIASES: Record<string, string> = {
+    "gpt-image-2": "gpt-image-2.5",
+};
+
+export function migrateLegacyModelValue(value: string | undefined) {
+    const model = (value || "").trim();
+    if (!model) return model;
+    const decoded = decodeChannelModel(model);
+    if (decoded) {
+        const replacement = LEGACY_MODEL_ALIASES[decoded.model];
+        return replacement ? encodeChannelModel(decoded.channelId, replacement) : model;
+    }
+    return LEGACY_MODEL_ALIASES[model] || model;
+}
+
 export function normalizeModelOptionValue(value: string | undefined, channels: ModelChannel[]) {
     const model = (value || "").trim();
     if (!model) return "";
@@ -364,10 +379,11 @@ export function normalizeAiConfig(persistedConfig: Partial<AiConfig>): AiConfig 
         apiFormat: normalizeApiFormat(config.apiFormat),
         channels,
         models,
-        imageModel: normalizeModelOptionValue(config.imageModel || config.model, channels),
-        videoModel: normalizeModelOptionValue(config.videoModel, channels),
-        textModel: normalizeModelOptionValue(config.textModel || config.model, channels),
-        audioModel: normalizeModelOptionValue(config.audioModel || defaultConfig.audioModel, channels),
+        model: normalizeModelOptionValue(migrateLegacyModelValue(config.model), channels) || defaultConfig.model,
+        imageModel: normalizeModelOptionValue(migrateLegacyModelValue(config.imageModel || config.model), channels),
+        videoModel: normalizeModelOptionValue(migrateLegacyModelValue(config.videoModel), channels),
+        textModel: normalizeModelOptionValue(migrateLegacyModelValue(config.textModel || config.model), channels),
+        audioModel: normalizeModelOptionValue(migrateLegacyModelValue(config.audioModel || defaultConfig.audioModel), channels),
         audioVoice: config.audioVoice || defaultConfig.audioVoice,
         audioFormat: config.audioFormat || defaultConfig.audioFormat,
         audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
