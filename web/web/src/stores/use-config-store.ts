@@ -71,6 +71,7 @@ const LOCAL_WORKBENCH_BASE_URL = typeof window === "undefined"
     : window.location.origin;
 const LOCAL_WORKBENCH_MODELS: ChannelModel[] = [
     { name: "gpt-image-2", capability: "image" },
+    { name: "gpt-image-2.5", capability: "image" },
     { name: "nano-banana-2", capability: "image" },
     { name: "nano-banana-fast", capability: "image" },
     { name: "nano-banana-pro", capability: "image" },

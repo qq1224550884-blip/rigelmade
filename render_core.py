@@ -83,6 +83,7 @@ PROVIDER_LABELS = {
 
 SUPPORTED_IMAGE_MODELS = (
     "gpt-image-2",
+    "gpt-image-2.5",
     "nano-banana-2",
     "nano-banana-fast",
     "nano-banana-pro",
@@ -182,9 +183,14 @@ def toapis_http_client() -> requests.Session:
 # （如 1824x1024 → 57:32），直接透传会被上游拒绝，必须先吸附到最近的标准比例。
 TOAPIS_IMAGE_RATIOS: dict[str, tuple[str, ...]] = {
     "gpt-image-2": ("1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21"),
+    "gpt-image-2.5-flare": ("1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "21:9"),
+    "gpt-image-2.5-sunburst": ("1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "21:9"),
     "gemini-3.1-flash-image-preview": ("1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "5:4", "4:5", "21:9", "1:4", "4:1", "1:8", "8:1"),
     "gemini-3-pro-image-preview": ("1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"),
 }
+
+# gpt-image-2.5 的清晰度档位是请求体顶层 resolution；其余模型走 metadata.resolution。
+TOAPIS_TOP_LEVEL_RESOLUTION_MODELS = ("gpt-image-2.5-flare", "gpt-image-2.5-sunburst")
 
 
 def toapis_image_aspect_ratio(model: str, ratio: str) -> str:
@@ -213,6 +219,9 @@ def toapis_image_model(model: str) -> str:
     value = sanitize_model(model)
     mapping = {
         "gpt-image-2": "gpt-image-2",
+        "gpt-image-2.5": "gpt-image-2.5-flare",
+        "gpt-image-2.5-flare": "gpt-image-2.5-flare",
+        "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
         "nano-banana-2": "gemini-3.1-flash-image-preview",
         "nano-banana-pro": "gemini-3-pro-image-preview",
         "nano-banana-fast": "gemini-3.1-flash-image-preview",
@@ -357,6 +366,16 @@ def pricing_quality(image_size: str) -> str:
     if value in normalized:
         return normalized[value]
     return value if value in {"auto", "low", "medium", "high", "standard", "hd"} else "standard"
+
+
+def toapis_resolution_tier(image_size: str) -> str:
+    """把前端清晰度档位（low/medium/high 或 1K/2K/4K）映射到 ToAPIs 的 1K/2K/4K 档。
+
+    前端传的是 low/medium/high，早期实现只在恰好等于 1K/2K/4K 时才把档位传上去，
+    导致中/高清档实际按默认 1K 出图，这里统一按价格表的档位映射。
+    """
+    quality = pricing_quality(image_size)
+    return {"auto": "1K", "low": "1K", "standard": "1K", "medium": "2K", "hd": "2K", "high": "4K"}.get(quality, "1K")
 
 
 def size_for_aspect(aspect_ratio: str) -> str:
@@ -838,9 +857,10 @@ def call_toapis(
         image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client))
 
     metadata: dict[str, Any] = {}
-    size = (req.image_size or "1K").strip().upper()
-    if size in {"1K", "2K", "4K"}:
-        metadata["resolution"] = size
+    resolution = toapis_resolution_tier(req.image_size)
+    payload_resolution = str(resolution) if model in TOAPIS_TOP_LEVEL_RESOLUTION_MODELS else ""
+    if not payload_resolution:
+        metadata["resolution"] = resolution
     ratio = toapis_image_aspect_ratio(model, req.aspect_ratio if req.aspect_ratio and req.aspect_ratio != "auto" else "1:1")
     ratio_width, ratio_height = (int(part) for part in ratio.split(":"))
     orientation = "landscape" if ratio_width > ratio_height else ("portrait" if ratio_width < ratio_height else "")
@@ -854,6 +874,8 @@ def call_toapis(
         "n": min(max(req.count, 1), 4),
         "metadata": metadata,
     }
+    if payload_resolution:
+        payload["resolution"] = payload_resolution
     if image_urls:
         payload["image_urls"] = image_urls
 

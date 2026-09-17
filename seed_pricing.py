@@ -15,6 +15,7 @@ from commercial_app import db, init_db, now
 # ------------------------------------------------------------------
 # 图片模型成本（toapis, 积分/张）与定价（积分/张，×1.5 向上取整）：
 #   gpt-image-2     1K 成本 3 → 定价 5；2K 成本 4 → 6；4K 成本 5 → 8
+#   gpt-image-2.5   官方 $0.015/0.020/0.025 每张，与 gpt-image-2 同档 → 5 / 6 / 8
 #   nano-banana-2   1K 成本 6 → 定价 9；2K 成本 8 → 12；4K 成本 12 → 18
 #   nano-banana-pro 成本 12 → 定价 18（全档）
 # ------------------------------------------------------------------
@@ -40,6 +41,7 @@ OBSOLETE_PRODUCT_IDS = (
 # 图片模型定价（积分/张，×1.5 向上取整），键为 model，值为 {resolution: credits}
 IMAGE_PRICES = {
     "gpt-image-2": {"1K": 5, "2K": 6, "4K": 8},
+    "gpt-image-2.5": {"1K": 5, "2K": 6, "4K": 8},
     "nano-banana-2": {"1K": 9, "2K": 12, "4K": 18},
     "nano-banana-fast": {"1K": 9, "2K": 12, "4K": 18},
     "nano-banana-pro": {"1K": 18, "2K": 18, "4K": 18},
