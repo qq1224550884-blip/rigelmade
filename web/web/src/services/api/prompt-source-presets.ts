@@ -24,6 +24,9 @@ export function createPromptSource(source?: Partial<PromptSource>): PromptSource
 }
 
 export const DEFAULT_PROMPT_SOURCES: PromptSource[] = [
+    localSource("wash-image-templates", "洗图 · 完整模板", "/prompt-sources/wash-image-templates.json"),
+    localSource("wash-image-modules", "洗图 · 模块词条", "/prompt-sources/wash-image-modules.json"),
+    localSource("wash-image-examples", "洗图 · 参考案例", "/prompt-sources/wash-image-examples.json"),
     registrySource("banana-prompt-quicker", "Banana Prompt Quicker", "https://glidea.github.io/banana-prompt-quicker/"),
     registrySource("davidwu-gpt-image2-prompts", "DavidWu GPT Image 2", "https://github.com/davidwuw0811-boop/awesome-gpt-image2-prompts"),
     registrySource("awesome-gpt-image", "Awesome GPT Image", "https://github.com/ZeroLu/awesome-gpt-image"),
@@ -31,6 +34,10 @@ export const DEFAULT_PROMPT_SOURCES: PromptSource[] = [
     registrySource("youmind-gpt-image-2", "YouMind GPT Image 2", "https://github.com/YouMind-OpenLab/awesome-gpt-image-2"),
     registrySource("youmind-nano-banana-pro", "YouMind Nano Banana Pro", "https://github.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts"),
 ];
+
+function localSource(id: string, name: string, url: string): PromptSource {
+    return { id, name, url, homepage: "", enabled: true, builtIn: true };
+}
 
 function registrySource(id: string, name: string, homepage: string): PromptSource {
     return { id, name, url: `${PROMPT_REGISTRY_SOURCE_BASE}/${id}.json`, homepage, enabled: true, builtIn: true };
