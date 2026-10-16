@@ -30,24 +30,55 @@ def _connection() -> sqlite3.Connection:
 
 def check_rate_limit(scope: str, key: str, max_events: int, window_seconds: int) -> int:
     """滑动窗口内允许 max_events 次；超限返回应等待的秒数，未超限返回 0。"""
+    wait, _ = check_rate_limits([(scope, key, max_events, window_seconds)])
+    return wait
+
+
+def check_rate_limits(limits: list[tuple[str, str, int, int]]) -> tuple[int, list[tuple[int, int]]]:
+    """原子检查所有窗口，通过后才计数；返回等待秒数和可撤销的计数凭据。"""
     now = int(time.time())
-    cutoff = now - window_seconds
     conn = _connection()
     try:
-        conn.execute("DELETE FROM rate_events WHERE event_at < ?", (cutoff,))
-        conn.execute("INSERT INTO rate_events(scope, key, event_at) VALUES(?, ?, ?)", (scope, key, now))
-        count = conn.execute(
-            "SELECT COUNT(*) FROM rate_events WHERE scope = ? AND key = ? AND event_at > ?",
-            (scope, key, cutoff),
-        ).fetchone()[0]
-        if count <= max_events:
-            return 0
-        # 计算最早一次事件还要多久移出窗口，作为重试等待时间
-        oldest = conn.execute(
-            "SELECT MIN(event_at) FROM rate_events WHERE scope = ? AND key = ? AND event_at > ?",
-            (scope, key, cutoff),
-        ).fetchone()[0] or now
-        return max(1, int(cutoff + window_seconds - oldest))
+        conn.execute("BEGIN IMMEDIATE")
+        wait = 0
+        for scope, key, max_events, window_seconds in limits:
+            cutoff = now - window_seconds
+            conn.execute("DELETE FROM rate_events WHERE scope = ? AND key = ? AND event_at <= ?", (scope, key, cutoff))
+            count = conn.execute(
+                "SELECT COUNT(*) FROM rate_events WHERE scope = ? AND key = ?",
+                (scope, key),
+            ).fetchone()[0]
+            if count >= max_events:
+                # 兼容旧版本累积的超限事件，等到有足够事件过期才能接收下一次。
+                expires_at = conn.execute(
+                    "SELECT event_at FROM rate_events WHERE scope = ? AND key = ? ORDER BY event_at LIMIT 1 OFFSET ?",
+                    (scope, key, count - max_events),
+                ).fetchone()[0] + window_seconds
+                wait = max(wait, expires_at - now)
+        events = []
+        if not wait:
+            for scope, key, _, _ in limits:
+                cursor = conn.execute("INSERT INTO rate_events(scope, key, event_at) VALUES(?, ?, ?)", (scope, key, now))
+                events.append((cursor.lastrowid, now))
+        conn.commit()
+        return wait, events
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_rate_limits(events: list[tuple[int, int]]) -> None:
+    """生成失败时退回本次计数；时间戳防止误删被 SQLite 重用的行号。"""
+    conn = _connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("DELETE FROM rate_events WHERE rowid = ? AND event_at = ?", events)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

@@ -672,7 +672,6 @@ def adjust_user_credits(user_id: str, payload: AdminCreditAdjustmentPayload, adm
 
 @app.post("/api/generate")
 def commercial_generate(request: Request, payload: CommercialGeneratePayload, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
-    enforce_generation_rate_limit(request, user["id"])
     try:
         request_model = render_core.GenerateRequest.model_validate(payload.request)
     except Exception as exc:
@@ -714,6 +713,7 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
             credits = int(price["credits"]) * output_count
         if user_balance(connection, user["id"]) < credits:
             raise HTTPException(status_code=402, detail="积分不足，请先充值。")
+        rate_events = enforce_generation_rate_limit(request, user["id"])
         job_id = uuid.uuid4().hex
         connection.execute("INSERT INTO render_jobs(id,user_id,idempotency_key,model,credits,status,created_at) VALUES(?,?,?,?,?,?,?)", (job_id, user["id"], key, request_model.model, credits, "reserved", now()))
         connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user["id"], -credits, "render_reserve", job_id, "生成预扣", now()))
@@ -723,6 +723,7 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
         with transaction() as connection:
             connection.execute("UPDATE render_jobs SET status = 'failed', completed_at = ? WHERE id = ?", (now(), job_id))
             connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user["id"], credits, "render_refund", job_id, "生成失败自动退款", now()))
+        rate_limit.release_rate_limits(rate_events)
         raise
     with transaction() as connection:
         connection.execute("UPDATE render_jobs SET status = 'succeeded', run_id = ?, result_json = ?, completed_at = ? WHERE id = ?", (result.get("runId"), json.dumps(result, ensure_ascii=False), now(), job_id))
@@ -893,14 +894,15 @@ def enforce_register_rate_limit(request: Request) -> None:
             raise HTTPException(status_code=429, detail=f"该邮箱注册过于频繁，请约 {wait_email} 秒后再试。")
 
 
-def enforce_generation_rate_limit(request: Request, user_id: str) -> None:
-    """生成防盗刷：每用户 60 次/小时，每 IP 120 次/小时（令牌泄露时兜底）。"""
-    wait_user = rate_limit.check_rate_limit("gen_user", user_id, 60, 3600)
-    if wait_user:
-        raise HTTPException(status_code=429, detail=f"生成频率过高，请约 {wait_user} 秒后再试。")
-    wait_ip = rate_limit.check_rate_limit("gen_ip", client_ip(request), 120, 3600)
-    if wait_ip:
-        raise HTTPException(status_code=429, detail=f"生成频率过高，请约 {wait_ip} 秒后再试。")
+def enforce_generation_rate_limit(request: Request, user_id: str) -> list[tuple[int, int]]:
+    """每用户 60 次/小时、每 IP 120 次/小时；只计新任务，失败退回次数。"""
+    wait, events = rate_limit.check_rate_limits([
+        ("gen_user", user_id, 60, 3600),
+        ("gen_ip", client_ip(request), 120, 3600),
+    ])
+    if wait:
+        raise HTTPException(status_code=429, detail=f"生成频率过高，请约 {wait} 秒后再试。", headers={"Retry-After": str(wait)})
+    return events
 
 
 if __name__ == "__main__":
