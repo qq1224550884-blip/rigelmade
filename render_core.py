@@ -873,8 +873,11 @@ def call_toapis(
     }
     if payload_resolution:
         payload["resolution"] = payload_resolution
+        payload["quality"] = "high"
+        payload.pop("metadata")
+    image_field = "reference_images" if payload_resolution else "image_urls"
     if image_urls:
-        payload["image_urls"] = image_urls
+        payload[image_field] = image_urls
 
     last_error = ""
     for attempt in range(1, TOAPIS_IMAGE_RETRY_ATTEMPTS + 1):
