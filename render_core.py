@@ -788,25 +788,23 @@ def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, clie
 def compress_upload_image(path: Path, mime: str) -> tuple[io.BytesIO, str, str] | None:
     """Return (bytes, filename, mime) when the image must be compressed, else None.
 
-    仅在文件超过 ToAPIs 上传上限时触发；用 Pillow 重编码为 JPEG，
+    文件超过上传上限或最长边超过 4096px 时触发；用 Pillow 重编码为 JPEG，
     先缩放到最长边不超过 2048px，再按需降质量，确保体积落回上限内。
     """
-    if path.stat().st_size <= TOAPIS_UPLOAD_MAX_BYTES:
-        return None
     try:
         from PIL import Image
     except ImportError:
-        raise RuntimeError("参考图超过 10MB 且服务器缺少压缩组件，请先压缩图片再上传。")
+        raise RuntimeError("服务器缺少图片压缩组件，请先压缩参考图再上传。")
     try:
-        image = Image.open(path)
-        image.load()
+        with Image.open(path) as source:
+            if path.stat().st_size <= TOAPIS_UPLOAD_MAX_BYTES and max(source.size) <= 4096:
+                return None
+            source.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+            image = source.copy()
     except Exception as exc:
         raise RuntimeError(f"参考图无法读取：{exc}") from exc
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
-    max_side = 2048
-    if max(image.size) > max_side:
-        image.thumbnail((max_side, max_side), Image.LANCZOS)
     for quality in (88, 78, 68, 55):
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=quality, optimize=True)

@@ -1,5 +1,6 @@
 """限流回归：隔离数据库，不调用上游、不访问生产数据。"""
 import importlib
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -10,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from test_wash import ASGIClient
+import httpx
 
 import rate_limit
 
@@ -96,13 +97,16 @@ class GenerationRateLimitTests(unittest.TestCase):
             db.execute("INSERT INTO credit_ledger VALUES('seed','test-user',1000,'test',NULL,'',0)")
         self.gateway.app.dependency_overrides[self.gateway.current_user] = lambda: {"id": "test-user"}
         self.addCleanup(self.gateway.app.dependency_overrides.clear)
-        self.client = ASGIClient(self.gateway.app)
 
     def request(self, key):
-        return self.client.post("/api/generate", json={
+        payload = {
             "request": {"model": "gpt-image-2.5", "prompt": "test", "imageSize": "low"},
             "idempotencyKey": key,
-        })
+        }
+        async def send():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.gateway.app), base_url="http://test") as client:
+                return await client.post("/api/generate", json=payload)
+        return asyncio.run(send())
 
     def rate_count(self):
         if not rate_limit._DB_PATH.exists():
