@@ -377,6 +377,41 @@ def toapis_resolution_tier(image_size: str) -> str:
     return {"auto": "1K", "low": "1K", "standard": "1K", "medium": "2K", "hd": "2K", "high": "4K"}.get(quality, "1K")
 
 
+def resolve_image_quality(image_size: str, requested_size: str) -> str:
+    """旧客户端只改像素尺寸时，也把分辨率和计费档位一起提升。"""
+    match = re.fullmatch(r"(\d+)x(\d+)", (requested_size or "").lower())
+    if not match:
+        return image_size
+    width, height = (int(value) for value in match.groups())
+    edge = max(width, height)
+    # 包括上游固定尺寸表的正方形 4K，以及 21:9 的 1K 预设。
+    inferred = "4K" if edge >= 3072 or (width == height and edge >= 2880) else "2K" if edge >= 2048 else "1K"
+    tiers = ["1K", "2K", "4K"]
+    return {"1K": "low", "2K": "medium", "4K": "high"}[inferred] if tiers.index(inferred) > tiers.index(toapis_resolution_tier(image_size)) else image_size
+
+
+def validate_output_resolution(req: GenerateRequest, target: Path, provider: str) -> dict[str, Any]:
+    """检查下载原图，拒绝把低档结果标为 2K/4K，也不插值伪造生成分辨率。"""
+    from PIL import Image
+    with Image.open(target) as image:
+        width, height = image.size
+    tier = toapis_resolution_tier(req.image_size)
+    if provider == "toapis" and tier != "1K":
+        if toapis_image_model(req.model) in TOAPIS_TOP_LEVEL_RESOLUTION_MODELS:
+            ratio = toapis_image_aspect_ratio(req.model, req.aspect_ratio)
+            presets = {
+                "2K": {"1:1": (2048, 2048), "3:2": (2048, 1360), "2:3": (1360, 2048), "4:3": (2048, 1536), "3:4": (1536, 2048), "16:9": (2048, 1152), "9:16": (1152, 2048), "21:9": (2688, 1152)},
+                "4K": {"1:1": (2880, 2880), "3:2": (3520, 2336), "2:3": (2336, 3520), "4:3": (3312, 2480), "3:4": (2480, 3312), "16:9": (3840, 2160), "9:16": (2160, 3840), "21:9": (3840, 1648)},
+            }
+            expected = presets[tier].get(ratio)
+            enough = width >= expected[0] * .95 and height >= expected[1] * .95 if expected else width * height >= (3_000_000 if tier == "2K" else 7_500_000)
+        else:
+            enough = max(width, height) >= (2048 if tier == "2K" else 3840) * .95
+        if not enough:
+            raise ValueError(f"上游未返回所选 {tier} 分辨率：实际 {width}×{height}px。已停止交付低分辨率结果，本站积分将自动退回。")
+    return {"width": width, "height": height, "resolution": tier}
+
+
 def size_for_aspect(aspect_ratio: str) -> str:
     options = {
         "1:1": "1024x1024",
@@ -449,7 +484,7 @@ def openai_generate_request(model: str, prompt: str, n: int, quality: str, size:
         prompt=prompt,
         model=selected_model,
         aspectRatio=aspect_ratio,
-        imageSize=quality or "low",
+        imageSize=resolve_image_quality(quality or "low", requested_size),
         count=min(max(n, 1), 4),
         images=images or [],
         requestedSize=requested_size,
@@ -831,6 +866,60 @@ def toapis_upload_video(api_base: str, api_key: str, path: Path, mime: str, clie
     return str(url)
 
 
+def validate_toapis_mask(model: str, input_files: list[dict[str, Any]]) -> Path | None:
+    masks = [item for item in input_files if item.get("role") == "mask"]
+    if not masks:
+        return None
+    # Only enable providers whose documented contract includes an alpha mask.
+    if model not in TOAPIS_IMAGE_RATIOS:
+        raise ValueError("当前 ToAPIs 模型未验证遮罩支持，已停止提交且不会自动换模型。请选择已支持遮罩的 GPT Image 2，或等待当前模型验证。")
+    sources = [item for item in input_files if item.get("role") != "mask"]
+    if len(masks) != 1 or not sources:
+        raise ValueError("局部编辑需要一张底图和一张遮罩")
+    mask_path, source_path = Path(masks[0]["file"]), Path(sources[0]["file"])
+    if model == "gpt-image-2" and any(path.stat().st_size > TOAPIS_UPLOAD_MAX_BYTES for path in (mask_path, source_path)):
+        raise ValueError("局部编辑底图及遮罩均须小于上传上限，请缩小底图后重新圈选，避免压缩破坏遮罩")
+    from PIL import Image
+    with Image.open(source_path) as source, Image.open(mask_path) as mask:
+        if model == "gpt-image-2" and max(source.size) > 4096:
+            raise ValueError("局部编辑底图最长边须不超过 4096px，请先缩小底图后重新圈选，避免自动压缩破坏遮罩")
+        if mask.format != "PNG" or "A" not in mask.getbands() or mask.size != source.size:
+            raise ValueError("遮罩必须为含透明通道的 PNG，且与底图像素尺寸一致")
+        if mask.getchannel("A").getextrema()[0] != 0:
+            raise ValueError("遮罩没有透明编辑区域，请重新圈选")
+    return mask_path
+
+
+def create_selection_guide(source_path: Path, mask_path: Path) -> Path:
+    """A visual selection reference for models with no documented mask field."""
+    from PIL import Image, ImageOps
+    with Image.open(source_path) as image, Image.open(mask_path) as mask:
+        base = image.convert("RGB")
+        selection = ImageOps.invert(mask.getchannel("A")).point(lambda value: round(value * .45))
+        guide = Image.composite(Image.new("RGB", base.size, (255, 0, 255)), base, selection)
+        path = mask_path.with_name("selection-guide.png")
+        guide.save(path)
+    return path
+
+
+def composite_masked_output(target: Path, input_files: list[dict[str, Any]]) -> Path:
+    """Keep every unselected pixel from the original; never return a raw whole-image edit."""
+    from PIL import Image, ImageOps
+    masks = [item for item in input_files if item.get("role") == "mask"]
+    if not masks:
+        return target
+    source_path = next(Path(item["file"]) for item in input_files if item.get("role") != "mask")
+    with Image.open(source_path) as source, Image.open(masks[0]["file"]) as mask, Image.open(target) as generated:
+        if abs((generated.width / generated.height) / (source.width / source.height) - 1) > .01:
+            raise ValueError("生成图画幅与底图不同，已停止合成，未交付整图变形结果")
+        result = Image.composite(generated.convert("RGBA"),
+                                 source.convert("RGBA").resize(generated.size, Image.Resampling.LANCZOS),
+                                 ImageOps.invert(mask.getchannel("A")).resize(generated.size, Image.Resampling.NEAREST))
+        output = target.with_name(target.stem + "-local-edit.png")
+        result.save(output)
+    return output
+
+
 def call_toapis(
     req: GenerateRequest,
     prompt: str,
@@ -841,6 +930,7 @@ def call_toapis(
     """Call toapis async image generation (POST task + GET poll)."""
     api_base = resolve_toapis_base_url(base_url)
     model = toapis_image_model(req.model or "gpt-image-2")
+    mask_path = validate_toapis_mask(model, input_files)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     client = toapis_http_client()
 
@@ -859,6 +949,15 @@ def call_toapis(
     if not payload_resolution:
         metadata["resolution"] = resolution
     ratio = toapis_image_aspect_ratio(model, req.aspect_ratio if req.aspect_ratio and req.aspect_ratio != "auto" else "1:1")
+    if mask_path:
+        from PIL import Image
+        source_path = next(Path(item["file"]) for item in input_files if item.get("role") != "mask")
+        with Image.open(source_path) as source:
+            source_ratio = source.width / source.height
+        ratios = TOAPIS_IMAGE_RATIOS.get(model, TOAPIS_IMAGE_RATIOS["gpt-image-2"])
+        ratio = min(ratios, key=lambda item: abs(int(item.split(":")[0]) / int(item.split(":")[1]) / source_ratio - 1))
+        if abs(int(ratio.split(":")[0]) / int(ratio.split(":")[1]) / source_ratio - 1) > .01:
+            raise ValueError("底图比例不在当前模型支持范围内，未提交局部生成；请保留构图并另选支持该比例的模型")
     ratio_width, ratio_height = (int(part) for part in ratio.split(":"))
     orientation = "landscape" if ratio_width > ratio_height else ("portrait" if ratio_width < ratio_height else "")
     if orientation:
@@ -878,9 +977,22 @@ def call_toapis(
     image_field = "reference_images" if payload_resolution else "image_urls"
     if image_urls:
         payload[image_field] = image_urls
+    if mask_path and model == "gpt-image-2":
+        payload["mask_url"] = toapis_upload_image(api_base, api_key, mask_path, "image/png", client)
+    elif mask_path:
+        source_path = next(Path(item["file"]) for item in input_files if item.get("role") != "mask")
+        guide = create_selection_guide(source_path, mask_path)
+        payload[image_field].append(toapis_upload_image(api_base, api_key, guide, "image/png", client))
+        payload["prompt"] = (
+            prompt + "\nThe LAST attachment is ONLY a selection guide for attachment 1: magenta tint marks the editable region. "
+            "Apply the requested material only there; remove all magenta guide tint in the result. "
+            "Attachments between the first and last are material references only. Keep the exact camera, geometry, "
+            "image aspect ratio and all other regions unchanged. Return the complete image, not a crop."
+        )
 
     last_error = ""
-    for attempt in range(1, TOAPIS_IMAGE_RETRY_ATTEMPTS + 1):
+    attempts = 1 if mask_path else TOAPIS_IMAGE_RETRY_ATTEMPTS
+    for attempt in range(1, attempts + 1):
         create_response = client.post(
             f"{api_base}/v1/images/generations",
             headers=headers,
@@ -934,9 +1046,9 @@ def call_toapis(
         else:
             last_error = "toapis image task timed out."
 
-        if attempt < TOAPIS_IMAGE_RETRY_ATTEMPTS:
+        if attempt < attempts:
             time.sleep(TOAPIS_IMAGE_RETRY_DELAY_SECONDS * attempt)
-    raise RuntimeError(f"{last_error} (retried {TOAPIS_IMAGE_RETRY_ATTEMPTS} times)")
+    raise RuntimeError(f"{last_error} (submitted {attempts} task(s))")
 
 
 def toapis_video_model(model: str) -> str:
@@ -1518,6 +1630,8 @@ def upload_data_url(data_url: str = Form(...), name: str = Form("clipboard.png")
 
 @app.post("/api/generate")
 def generate(req: GenerateRequest) -> dict[str, Any]:
+    if not is_video_model(req.model):
+        req.image_size = resolve_image_quality(req.image_size, req.requested_size)
     # Provider resolution. When TOAPIS_API_KEY is configured it is the active relay:
     # route every image model through toapis (unless the caller explicitly pinned a
     # non-default provider). Otherwise infer banana vs gpt by model name.
@@ -1645,7 +1759,9 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
                     suffix = ext_for_mime(mime)
                     target = output_path / f"{run_id}-{index:02d}{suffix}"
                     target.write_bytes(raw)
-                    outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}"})
+                    dimensions = validate_output_resolution(req, target, provider)
+                    target = composite_masked_output(target, saved_inputs)
+                    outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}", **dimensions})
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"inline image {index}: {exc}")
                 continue
@@ -1661,10 +1777,16 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
                 image_response = (toapis_http_client() if provider == "toapis" else requests).get(url, timeout=300)
                 image_response.raise_for_status()
                 target.write_bytes(image_response.content)
-                outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}"})
+                dimensions = {} if is_video_model(req.model) else validate_output_resolution(req, target, provider)
+                target = composite_masked_output(target, saved_inputs)
+                outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}", **dimensions})
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url}: {exc}")
 
+        if not outputs and any(item.get("role") == "mask" for item in saved_inputs):
+            raise ValueError("局部编辑下载或合成失败：" + "; ".join(errors))
+        if not outputs and not is_video_model(req.model) and toapis_resolution_tier(req.image_size) != "1K":
+            raise ValueError("高分辨率原图下载或校验失败：" + "; ".join(errors))
         if not outputs and remote_urls:
             outputs = [{"name": f"remote-{idx + 1}", "url": url} for idx, url in enumerate(remote_urls)]
 

@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 import rate_limit
@@ -677,6 +678,8 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
     except Exception as exc:
         raise HTTPException(status_code=400, detail="生成请求格式无效。") from exc
     key = payload.idempotency_key.strip()
+    if not render_core.is_video_model(request_model.model):
+        request_model.image_size = render_core.resolve_image_quality(request_model.image_size, request_model.requested_size)
     if not key or len(key) > 120:
         raise HTTPException(status_code=400, detail="缺少有效的幂等请求编号。")
     with transaction() as connection:
@@ -780,7 +783,7 @@ async def commercial_image_edits(
         request_model = render_core.openai_generate_request(model, prompt, n, quality, size, images)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    result = commercial_generate(req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
+    result = await run_in_threadpool(commercial_generate, req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
     return openai_image_result(result)
 
 

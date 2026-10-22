@@ -7,6 +7,7 @@ import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
 import type { ReferenceImage } from "@/types/image";
+import { resolveImageQuality } from "@/lib/image-resolution";
 
 export type AiTextMessage = {
     role: "system" | "user" | "assistant";
@@ -116,8 +117,8 @@ const IMAGE_OUTPUT_FORMAT = "png";
 const GEMINI_SUPPORTED_RATIOS = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
 const GEMINI_IMAGE_SIZE_BY_QUALITY: Record<string, string> = { low: "1K", medium: "2K", high: "4K", standard: "1K", hd: "2K" };
 
-function normalizeQuality(quality: string) {
-    const value = quality.trim().toLowerCase();
+function normalizeQuality(quality: string, size = "auto") {
+    const value = resolveImageQuality(quality.trim(), size);
     const normalized = QUALITY_ALIASES[value] || value;
     return QUALITY_BASE[normalized] ? normalized : undefined;
 }
@@ -773,7 +774,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const script = resolveModelScript(config, config.model || config.imageModel);
     if (script) {
-        const quality = normalizeQuality(config.quality);
+        const quality = normalizeQuality(config.quality, config.size);
         const requestSize = resolveRequestSize(quality, config.size);
         const background = normalizeBackground(config.background);
         try {
@@ -798,7 +799,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, "请求失败"));
         }
     }
-    const quality = normalizeQuality(config.quality);
+    const quality = normalizeQuality(config.quality, config.size);
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
     try {
@@ -832,7 +833,8 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     const requestPrompt = buildImageReferencePromptText(prompt, references);
     const script = resolveModelScript(config, config.model || config.imageModel);
     if (script) {
-        const quality = normalizeQuality(config.quality);
+        if (mask) throw new Error("当前模型插件未支持遮罩传递，请使用支持遮罩的 OpenAI 兼容通道");
+        const quality = normalizeQuality(config.quality, config.size);
         const requestSize = resolveRequestSize(quality, config.size);
         const background = normalizeBackground(config.background);
         const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
@@ -862,7 +864,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 
     if (requestConfig.apiFormat === "ark") {
         if (mask) throw new Error("蒙版编辑暂不支持该模型，请使用其他渠道");
-        const quality = normalizeQuality(config.quality);
+        const quality = normalizeQuality(config.quality, config.size);
         const requestSize = resolveRequestSize(quality, config.size);
         const background = normalizeBackground(config.background);
         const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
@@ -891,7 +893,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         }
     }
 
-    const quality = normalizeQuality(config.quality);
+    const quality = normalizeQuality(config.quality, config.size);
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
     const formData = new FormData();

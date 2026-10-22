@@ -130,6 +130,7 @@ export function useImageEditorViewport(image: ImageSize | null, open: boolean) {
         const handleWheel = (event: WheelEvent) => {
             event.preventDefault();
             event.stopPropagation();
+            if (event.buttons) return;
             setZoomAround(event.deltaY < 0 ? zoom * zoomStep : zoom / zoomStep, event.clientX, event.clientY);
         };
         viewportElement.addEventListener("wheel", handleWheel, { passive: false });

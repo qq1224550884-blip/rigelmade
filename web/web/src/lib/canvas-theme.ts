@@ -8,7 +8,7 @@ export const canvasThemes = {
             dot: "rgba(68,64,60,.28)",
             line: "rgba(68,64,60,.12)",
             selectionStroke: "#1c1917",
-            selectionFill: "rgba(28,25,23,.06)",
+            selectionFill: "rgba(28,25,23,.12)",
         },
         node: {
             label: "#57534e",
@@ -36,7 +36,7 @@ export const canvasThemes = {
             dot: "rgba(245,245,244,.24)",
             line: "rgba(245,245,244,.10)",
             selectionStroke: "#fafaf9",
-            selectionFill: "rgba(250,250,249,.10)",
+            selectionFill: "rgba(250,250,249,.16)",
         },
         node: {
             label: "#d6d3d1",
