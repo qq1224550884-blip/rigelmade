@@ -499,7 +499,7 @@ function ErrorContent({ node, theme, onRetry }: Pick<NodeContentRendererProps, "
                 onMouseDown={(event) => event.stopPropagation()}
             >
                 <RefreshCw className="size-3.5" />
-                重试
+                {node.metadata?.generationTaskKey ? "继续取图" : "重试"}
             </button>
         </div>
     );

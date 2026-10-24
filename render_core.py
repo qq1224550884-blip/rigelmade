@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 import requests
+import render_delivery as delivery
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -29,6 +30,7 @@ STATIC_DIR = APP_DIR / "static"
 DATA_DIR = Path(os.getenv("AI_CANVAS_DATA_DIR", APP_DIR / "data")).resolve()
 ASSET_DIR = DATA_DIR / "assets"
 RUN_DIR = DATA_DIR / "runs"
+JOB_STATE_DIR = DATA_DIR.parent / "render-job-state"
 # 渠道地址只从环境变量读取（GRSAI_BASE_URL / NANO_BANANA_BASE_URL / FAST_BANANA_BASE_URL），
 # 代码默认值为空，不硬编码任何渠道域名。
 DEFAULT_BASE_URL = os.getenv("GRSAI_BASE_URL", "")
@@ -394,6 +396,7 @@ def validate_output_resolution(req: GenerateRequest, target: Path, provider: str
     """检查下载原图，拒绝把低档结果标为 2K/4K，也不插值伪造生成分辨率。"""
     from PIL import Image
     with Image.open(target) as image:
+        image.load()
         width, height = image.size
     tier = toapis_resolution_tier(req.image_size)
     if provider == "toapis" and tier != "1K":
@@ -789,6 +792,11 @@ def call_gemini_native(
 
 
 def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
+    return delivery.cached_upload(api_base, api_key, path, mime,
+                                  lambda: _toapis_upload_image(api_base, api_key, path, mime, client))
+
+
+def _toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
     """Upload a local image to toapis and return its public URL.
 
     ToAPIs 上传上限为 10MB，超限参考图在上传前自动压缩（重编码为 JPEG）。
@@ -926,6 +934,7 @@ def call_toapis(
     input_files: list[dict[str, Any]],
     api_key: str,
     base_url: str,
+    progress: delivery.RunProgress | None = None,
 ) -> dict[str, Any]:
     """Call toapis async image generation (POST task + GET poll)."""
     api_base = resolve_toapis_base_url(base_url)
@@ -936,6 +945,8 @@ def call_toapis(
 
     # Build payload. toapis accepts http(s) URLs only for image inputs; upload local files first.
     image_urls: list[str] = []
+    if progress:
+        progress.update("uploading")
     for item in input_files:
         if item.get("role") == "mask":
             continue
@@ -993,6 +1004,8 @@ def call_toapis(
     last_error = ""
     attempts = 1 if mask_path else TOAPIS_IMAGE_RETRY_ATTEMPTS
     for attempt in range(1, attempts + 1):
+        if progress:
+            progress.update("submitting")
         create_response = client.post(
             f"{api_base}/v1/images/generations",
             headers=headers,
@@ -1005,19 +1018,32 @@ def call_toapis(
         task_id = created.get("id") or task_id_from_response(created)
         if not task_id:
             raise RuntimeError("toapis returned no image task id.")
+        if progress:
+            progress.update("waiting", upstreamTaskId=task_id, upstreamModel=model)
 
         deadline = time.time() + DEFAULT_BANANA_WAIT_SECONDS
         while time.time() < deadline:
             time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
-            poll_response = client.get(
-                f"{api_base}/v1/images/generations/{task_id}",
-                headers=headers,
-                timeout=DEFAULT_TIMEOUT_SECONDS,
-            )
+            try:
+                poll_response = client.get(
+                    f"{api_base}/v1/images/generations/{task_id}",
+                    headers=headers,
+                    timeout=DEFAULT_TIMEOUT_SECONDS,
+                )
+            except requests.RequestException as exc:
+                if progress:
+                    progress.update("awaiting_recovery", error="查询上游任务中断，可继续查询原任务")
+                    raise delivery.DeliveryPending(progress.data["runId"], "查询上游任务中断，可继续取回原任务") from exc
+                raise
             if poll_response.status_code >= 400:
+                if progress:
+                    progress.update("awaiting_recovery", error="上游状态暂时无法读取，可继续查询原任务")
+                    raise delivery.DeliveryPending(progress.data["runId"], "上游状态暂时无法读取，可继续取图")
                 raise response_error(poll_response)
             result_data = poll_response.json()
             status = str(result_data.get("status") or "").lower()
+            if progress:
+                progress.update("waiting", upstreamStatus=status)
             if status == "completed":
                 urls: list[str] = []
                 result = result_data.get("result") or {}
@@ -1033,8 +1059,12 @@ def call_toapis(
                         "model": model,
                         "status": "succeeded",
                         "data": [{"url": url} for url in urls],
+                        "expiresAt": result_data.get("expires_at"),
                     }
                 last_error = "toapis image task completed without an image URL."
+                if progress:
+                    progress.update("awaiting_recovery", error="上游已完成，正在等待原图地址；可继续取图")
+                    raise delivery.DeliveryPending(progress.data["runId"], "上游已完成，可继续查询原图地址")
                 break
             if status in {"failed", "error", "cancelled", "canceled"}:
                 error = result_data.get("error") or {}
@@ -1045,6 +1075,9 @@ def call_toapis(
                 break
         else:
             last_error = "toapis image task timed out."
+            if progress:
+                progress.update("awaiting_recovery", error="原任务仍在处理中，可稍后继续查询")
+                raise delivery.DeliveryPending(progress.data["runId"], "原任务仍在处理中，可继续查询，不会重新生图")
 
         if attempt < attempts:
             time.sleep(TOAPIS_IMAGE_RETRY_DELAY_SECONDS * attempt)
@@ -1629,7 +1662,7 @@ def upload_data_url(data_url: str = Form(...), name: str = Form("clipboard.png")
 
 
 @app.post("/api/generate")
-def generate(req: GenerateRequest) -> dict[str, Any]:
+def generate(req: GenerateRequest, on_progress=None, cache_scope="") -> dict[str, Any]:
     if not is_video_model(req.model):
         req.image_size = resolve_image_quality(req.image_size, req.requested_size)
     # Provider resolution. When TOAPIS_API_KEY is configured it is the active relay:
@@ -1655,6 +1688,8 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
     output_path = run_path / "outputs"
     input_path.mkdir(parents=True, exist_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
+    progress = delivery.RunProgress(JOB_STATE_DIR, run_id, on_progress)
+    progress.update("preparing", model=req.model, provider=provider)
 
     saved_inputs: list[dict[str, Any]] = []
     for index, image in enumerate(req.images, start=1):
@@ -1732,7 +1767,9 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
             if is_video_model(req.model or ""):
                 api_response = call_toapis_video(req, effective_prompt, saved_inputs, saved_video_inputs, api_key, base_url)
             else:
-                api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url)
+                with delivery.upload_scope(cache_scope, progress.upload):
+                    api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url,
+                                              progress=progress)
         elif req.model == "nano-banana-2":
             api_response = call_gemini_native(req, effective_prompt, saved_inputs, api_key, base_url)
         elif provider == "banana":
@@ -1741,67 +1778,120 @@ def generate(req: GenerateRequest) -> dict[str, Any]:
             api_response = call_fast_banana_chat(req, effective_prompt, saved_inputs, api_key, base_url)
         else:
             api_response = call_grsai(req, effective_prompt, saved_inputs, api_key, base_url)
+    except delivery.DeliveryPending:
+        raise
     except Exception as exc:  # noqa: BLE001
         err_text = str(exc)
+        progress.update("failed", error=err_text)
         quota_exhausted = is_quota_exhausted_error(err_text)
         report_key_error(provider, api_key, quota_exhausted or "429" in err_text or "rate" in err_text.lower(), quota_exhausted)
         (run_path / "error.json").write_text(json.dumps({"error": err_text}, ensure_ascii=False, indent=2), encoding="utf-8")
         raise HTTPException(status_code=502, detail=QUOTA_EXHAUSTED_MESSAGE if quota_exhausted else err_text) from exc
     (run_path / "response.json").write_text(json.dumps(api_response, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        remote_urls = result_urls(api_response)
-        outputs = []
-        errors = []
-        for index, url in enumerate(remote_urls, start=1):
+    return save_generation_outputs(req, run_id, api_response, saved_inputs, provider, progress)
+
+
+def save_generation_outputs(req: GenerateRequest, run_id: str, api_response: dict[str, Any],
+                            saved_inputs: list[dict[str, Any]], provider: str, progress: delivery.RunProgress) -> dict[str, Any]:
+    run_path = RUN_DIR / run_id
+    remote_urls = result_urls(api_response)
+    outputs, download_errors, validation_errors = [], [], []
+    progress.update("downloading")
+    for index, url in enumerate(remote_urls, start=1):
+        suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+        if url.startswith("data:image/"):
+            raw, mime = data_url_to_bytes(url)
+            suffix = ext_for_mime(mime)
+        elif is_video_model(req.model):
+            suffix = suffix if suffix in {".mp4", ".webm", ".mov"} else ".mp4"
+        else:
+            suffix = suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else ".png"
+        target = run_path / "outputs" / f"{run_id}-{index:02d}{suffix}"
+        try:
             if url.startswith("data:image/"):
-                try:
-                    raw, mime = data_url_to_bytes(url)
-                    suffix = ext_for_mime(mime)
-                    target = output_path / f"{run_id}-{index:02d}{suffix}"
-                    target.write_bytes(raw)
-                    dimensions = validate_output_resolution(req, target, provider)
-                    target = composite_masked_output(target, saved_inputs)
-                    outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}", **dimensions})
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"inline image {index}: {exc}")
-                continue
-            parsed_suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
-            if is_video_model(req.model or ""):
-                suffix = parsed_suffix if parsed_suffix in {".mp4", ".webm", ".mov"} else ".mp4"
-            elif parsed_suffix in {".jpg", ".jpeg", ".png", ".webp"}:
-                suffix = parsed_suffix
+                target.write_bytes(raw)
             else:
-                suffix = ".png"
-            target = output_path / f"{run_id}-{index:02d}{suffix}"
-            try:
-                image_response = (toapis_http_client() if provider == "toapis" else requests).get(url, timeout=300)
-                image_response.raise_for_status()
-                target.write_bytes(image_response.content)
-                dimensions = {} if is_video_model(req.model) else validate_output_resolution(req, target, provider)
-                target = composite_masked_output(target, saved_inputs)
-                outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}", **dimensions})
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url}: {exc}")
+                valid_existing = False
+                if target.is_file() and not is_video_model(req.model):
+                    try:
+                        from PIL import Image
+                        with Image.open(target) as image:
+                            image.verify()
+                        valid_existing = True
+                    except (OSError, SyntaxError):
+                        pass
+                if not valid_existing:
+                    progress.update("downloading", imageIndex=index, imageCount=len(remote_urls))
+                    delivery.download_original(toapis_http_client() if provider == "toapis" else requests,
+                                               url, target, JOB_STATE_DIR / "partials" / run_id, progress)
+        except (requests.RequestException, OSError) as error:
+            download_errors.append(str(error))
+            continue
+        try:
+            progress.update("validating")
+            dimensions = {} if is_video_model(req.model) else validate_output_resolution(req, target, provider)
+            target = composite_masked_output(target, saved_inputs)
+            outputs.append({"name": target.name, "url": f"/data/runs/{run_id}/outputs/{target.name}", **dimensions})
+        except Exception as error:
+            validation_errors.append(str(error))
+    if validation_errors or not remote_urls:
+        message = "原图校验失败：" + "; ".join(validation_errors or ["上游没有返回图片地址"])
+        progress.update("failed", error=message)
+        raise HTTPException(status_code=502, detail=message)
+    if download_errors:
+        progress.update("awaiting_recovery", error="已生成，原图传输中断；继续取图不会再次生图或扣费")
+        raise delivery.DeliveryPending(run_id, "已生成，原图传输中断；请继续取图，不会重新生图或再次扣费")
+    result = {"ok": True, "runId": run_id, "status": "succeeded", "outputs": outputs,
+              "remoteUrls": remote_urls, "errors": [], "message": "generated"}
+    (run_path / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    progress.update("completed", error="")
+    return result
 
-        if not outputs and any(item.get("role") == "mask" for item in saved_inputs):
-            raise ValueError("局部编辑下载或合成失败：" + "; ".join(errors))
-        if not outputs and not is_video_model(req.model) and toapis_resolution_tier(req.image_size) != "1K":
-            raise ValueError("高分辨率原图下载或校验失败：" + "; ".join(errors))
-        if not outputs and remote_urls:
-            outputs = [{"name": f"remote-{idx + 1}", "url": url} for idx, url in enumerate(remote_urls)]
 
-        return {
-            "ok": True,
-            "runId": run_id,
-            "status": api_response.get("status") or ("succeeded" if outputs else "unknown"),
-            "outputs": outputs,
-            "remoteUrls": remote_urls,
-            "errors": errors,
-            "message": "generated" if outputs else "no image urls found in api response",
-        }
-    except Exception as exc:  # noqa: BLE001
-        (run_path / "error.json").write_text(json.dumps({"error": str(exc), "stage": "save_outputs"}, ensure_ascii=False, indent=2), encoding="utf-8")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+def resume_generation(run_id: str, on_progress=None) -> dict[str, Any]:
+    """Resume the recorded upstream task or download; never POST a new generation."""
+    if not re.fullmatch(r"\d{8}-\d{6}-[a-f0-9]{8}", run_id):
+        raise ValueError("任务编号无效")
+    run_path = RUN_DIR / run_id
+    request = json.loads((run_path / "request.json").read_text(encoding="utf-8"))
+    progress = delivery.RunProgress(JOB_STATE_DIR, run_id, on_progress)
+    req = GenerateRequest(model=request["model"], provider=request["provider"],
+                          imageSize=request["imageSize"], aspectRatio=request["aspectRatio"],
+                          requestedSize=request.get("size", ""), count=request.get("count", 1))
+    response_path = run_path / "response.json"
+    if response_path.is_file():
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+    else:
+        task_id = progress.data.get("upstreamTaskId")
+        if not task_id or req.provider != "toapis":
+            progress.update("awaiting_recovery", error="原任务结果尚未确认，已停止自动重新生成")
+            raise delivery.DeliveryPending(run_id, "原任务结果尚未确认，已停止自动重新生成")
+        progress.update("waiting")
+        client = toapis_http_client()
+        base = resolve_toapis_base_url(current_base_url("toapis"))
+        deadline = time.monotonic() + DEFAULT_BANANA_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            polled = client.get(f"{base}/v1/images/generations/{task_id}",
+                                headers={"Authorization": f"Bearer {current_api_key('toapis')}"}, timeout=DEFAULT_TIMEOUT_SECONDS)
+            polled.raise_for_status()
+            data = polled.json()
+            status = str(data.get("status", "")).lower()
+            progress.update("waiting", upstreamStatus=status)
+            if status == "completed":
+                urls = result_urls(data.get("result") or {}) or result_urls(data)
+                if not urls:
+                    progress.update("awaiting_recovery", error="上游已完成，等待原图地址；可继续取图")
+                    raise delivery.DeliveryPending(run_id, "上游已完成，等待原图地址；可继续取图")
+                response = {"id": task_id, "status": "succeeded", "data": [{"url": url} for url in urls]}
+                response_path.write_text(json.dumps(response), encoding="utf-8")
+                break
+            if status in {"failed", "error", "cancelled", "canceled"}:
+                raise HTTPException(status_code=502, detail="上游原任务已失败，本站积分将退回")
+            time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
+        else:
+            progress.update("awaiting_recovery", error="原任务仍在处理中，可稍后继续查询")
+            raise delivery.DeliveryPending(run_id, "原任务仍在处理中，可稍后继续查询")
+    return save_generation_outputs(req, run_id, response, request.get("images", []), req.provider, progress)
 
 
 def openai_image_response(result: dict[str, Any], request: Request) -> dict[str, Any]:

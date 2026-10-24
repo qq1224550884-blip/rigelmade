@@ -8,6 +8,7 @@ import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
 import type { ReferenceImage } from "@/types/image";
 import { resolveImageQuality } from "@/lib/image-resolution";
+import { GenerationJobError, isWorkbenchImageApi, recoverGenerationImage, requestWorkbenchImage } from "@/services/generation-jobs";
 
 export type AiTextMessage = {
     role: "system" | "user" | "assistant";
@@ -92,7 +93,7 @@ type GeminiPayload = {
     promptFeedback?: { blockReason?: string };
 };
 type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string };
-type RequestOptions = { signal?: AbortSignal };
+type RequestOptions = { signal?: AbortSignal; onTask?: (key: string) => void };
 
 const QUALITY_BASE: Record<string, number> = {
     low: 1024,
@@ -803,9 +804,8 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
     try {
-        const response = await axios.post<ImageApiResponse>(
-            aiApiUrl(requestConfig, "/images/generations"),
-            {
+        const url = aiApiUrl(requestConfig, "/images/generations");
+        const body = {
                 model: requestConfig.model,
                 prompt: withSystemPrompt(requestConfig, prompt),
                 n,
@@ -814,15 +814,14 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
                 ...(background ? { background } : {}),
                 response_format: "b64_json",
                 output_format: IMAGE_OUTPUT_FORMAT,
-            },
-            {
-                headers: aiHeaders(requestConfig, "application/json"),
-                signal: options?.signal,
-            },
-        );
+            };
+        const response = isWorkbenchImageApi(url)
+            ? { data: await requestWorkbenchImage(url, body, aiHeaders(requestConfig, "application/json"), options) }
+            : await axios.post<ImageApiResponse>(url, body, { headers: aiHeaders(requestConfig, "application/json"), signal: options?.signal });
         const images = parseImagePayload(response.data);
         return images;
     } catch (error) {
+        if (error instanceof GenerationJobError) throw error;
         throw new Error(readAxiosError(error, "请求失败"));
     }
 }
@@ -916,12 +915,20 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (mask) formData.set("mask", dataUrlToFile(mask));
 
     try {
-        const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
+        const url = aiApiUrl(requestConfig, "/images/edits");
+        const response = isWorkbenchImageApi(url)
+            ? { data: await requestWorkbenchImage(url, formData, aiHeaders(requestConfig), options) }
+            : await axios.post<ImageApiResponse>(url, formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
         const images = parseImagePayload(response.data);
         return images;
     } catch (error) {
+        if (error instanceof GenerationJobError) throw error;
         throw new Error(readAxiosError(error, "请求失败"));
     }
+}
+
+export async function requestGenerationRecovery(taskKey: string, options?: RequestOptions) {
+    return parseImagePayload(await recoverGenerationImage(taskKey, options?.signal));
 }
 
 export async function requestImageQuestion(config: AiConfig, messages: AiTextMessage[], onDelta: (text: string) => void, options?: RequestOptions) {
@@ -958,6 +965,7 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
         if (answer === "没有返回内容") onDelta(answer);
         return answer;
     } catch (error) {
+        if (error instanceof GenerationJobError) throw error;
         throw new Error(readAxiosError(error, "请求失败"));
     }
 }
@@ -982,6 +990,7 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
             .filter((id): id is string => Boolean(id))
             .sort((a, b) => a.localeCompare(b));
     } catch (error) {
+        if (error instanceof GenerationJobError) throw error;
         throw new Error(readAxiosError(error, "读取模型失败"));
     }
 }

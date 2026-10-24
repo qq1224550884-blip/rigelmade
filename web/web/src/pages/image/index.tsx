@@ -14,7 +14,8 @@ import { modelOptionLabel, modelOptionName, useConfigStore, useEffectiveConfig, 
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
-import { requestEdit, requestGeneration } from "@/services/api/image";
+import { requestEdit, requestGeneration, requestGenerationRecovery } from "@/services/api/image";
+import { GenerationJobError } from "@/services/generation-jobs";
 import { deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
@@ -34,6 +35,7 @@ type GeneratedImage = {
 
 type GenerationResult = {
     id: string;
+    taskKey?: string;
     status: "pending" | "success" | "failed";
     image?: GeneratedImage;
     error?: string;
@@ -340,30 +342,32 @@ export default function ImagePage() {
         return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
     };
 
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
+    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, taskKey?: string) => {
         const itemStartedAt = performance.now();
         try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
+            const options = { onTask: (key: string) => setResults((value) => updateResultAt(value, index, { taskKey: key })) };
+            const result = taskKey ? await requestGenerationRecovery(taskKey) : snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references, undefined, options) : await requestGeneration(snapshot.config, snapshot.text, options);
             const image = result[0];
             if (!image) throw new Error("接口没有返回图片");
             const meta = await readImageMeta(image.dataUrl);
             const nextImage = { id: image.id, dataUrl: image.dataUrl, durationMs: performance.now() - itemStartedAt, width: meta.width, height: meta.height, bytes: getDataUrlByteSize(image.dataUrl) };
-            setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
+            setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage, error: undefined, taskKey: undefined }));
             return nextImage;
         } catch (error) {
-            setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : "生成失败" }));
+            setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : "生成失败", ...(error instanceof GenerationJobError ? { taskKey: error.recoverable ? error.taskKey : undefined } : {}) }));
             throw error;
         }
     };
 
     const retryResult = async (index: number) => {
-        const snapshot = buildRequestSnapshot();
+        const taskKey = results[index]?.taskKey;
+        const snapshot = taskKey ? { text: prompt, config: { ...effectiveConfig, model, count: "1" }, references: [...references] } : buildRequestSnapshot();
         if (!snapshot) return;
         setPreviewLog(null);
         setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
         const retryStartedAt = performance.now();
         try {
-            const image = await runGenerationSlot(index, snapshot);
+            const image = await runGenerationSlot(index, snapshot, taskKey);
             const stored = await uploadImage(image.dataUrl);
             const logImage = { ...image, dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
             setResults((value) => updateResultAt(value, index, { image: { ...image, dataUrl: stored.url, storageKey: stored.storageKey } }));
@@ -380,7 +384,7 @@ export default function ImagePage() {
                     images: [logImage],
                 }),
             );
-            message.success("重试成功");
+            message.success(taskKey ? "原任务取图成功" : "重试成功");
         } catch {
             // runGenerationSlot 已经把结果状态更新为 failed
         }
@@ -532,7 +536,7 @@ export default function ImagePage() {
                                     result.status === "success" && result.image ? (
                                         <ResultImageCard key={result.id} image={result.image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
                                     ) : result.status === "failed" ? (
-                                        <FailedImageCard key={result.id} error={result.error || "生成失败"} onRetry={() => retryResult(index)} />
+                                        <FailedImageCard key={result.id} error={result.error || "生成失败"} recoverable={Boolean(result.taskKey)} onRetry={() => retryResult(index)} />
                                     ) : (
                                         <PendingImageCard key={result.id} />
                                     ),
@@ -663,7 +667,7 @@ function PendingImageCard() {
     );
 }
 
-function FailedImageCard({ error, onRetry }: { error: string; onRetry: () => void }) {
+function FailedImageCard({ error, onRetry, recoverable }: { error: string; onRetry: () => void; recoverable?: boolean }) {
     return (
         <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
             <div className="flex aspect-square flex-col items-center justify-center gap-3 p-5 text-center">
@@ -674,7 +678,7 @@ function FailedImageCard({ error, onRetry }: { error: string; onRetry: () => voi
             </div>
             <div className="flex justify-end border-t border-red-200 p-3 dark:border-red-950">
                 <Button size="small" danger onClick={onRetry}>
-                    重试
+                    {recoverable ? "继续取图" : "重试"}
                 </Button>
             </div>
         </div>

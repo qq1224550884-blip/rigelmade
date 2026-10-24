@@ -4,6 +4,7 @@ import { App } from "antd";
 
 import { createModelChannel, useConfigStore } from "@/stores/use-config-store";
 import { usePromptSourceScheduler } from "@/hooks/use-prompt-source-scheduler";
+import { GenerationProgress } from "@/components/layout/generation-progress";
 
 export function ClientRootInit({ children }: { children: ReactNode }) {
     const { message } = App.useApp();
@@ -47,5 +48,5 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
         message.success("已导入本地直连配置");
     }, [config.channels, message, openConfigDialog, updateConfig]);
 
-    return <>{children}</>;
+    return <>{children}<GenerationProgress /></>;
 }

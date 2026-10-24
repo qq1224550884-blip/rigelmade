@@ -13,9 +13,10 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -24,7 +25,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -54,6 +56,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 render_core.DATA_DIR = DATA_DIR / "render-data"
 render_core.ASSET_DIR = render_core.DATA_DIR / "assets"
 render_core.RUN_DIR = render_core.DATA_DIR / "runs"
+render_core.JOB_STATE_DIR = DATA_DIR / "render-job-state"
 render_core.ASSET_DIR.mkdir(parents=True, exist_ok=True)
 render_core.RUN_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -673,6 +676,10 @@ def adjust_user_credits(user_id: str, payload: AdminCreditAdjustmentPayload, adm
 
 @app.post("/api/generate")
 def commercial_generate(request: Request, payload: CommercialGeneratePayload, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+    return start_commercial_generation(request, payload, user)
+
+
+def start_commercial_generation(request: Request, payload: CommercialGeneratePayload, user, background=None) -> dict[str, Any]:
     try:
         request_model = render_core.GenerateRequest.model_validate(payload.request)
     except Exception as exc:
@@ -685,6 +692,8 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
     with transaction() as connection:
         existing = connection.execute("SELECT * FROM render_jobs WHERE user_id = ? AND idempotency_key = ?", (user["id"], key)).fetchone()
         if existing is not None:
+            if background is not None:
+                return generation_job_view(existing)
             if existing["status"] == "succeeded" and existing["result_json"]:
                 return json.loads(existing["result_json"])
             raise HTTPException(status_code=409, detail="该生成任务正在处理或刚刚失败，请勿重复提交。")
@@ -720,17 +729,135 @@ def commercial_generate(request: Request, payload: CommercialGeneratePayload, us
         job_id = uuid.uuid4().hex
         connection.execute("INSERT INTO render_jobs(id,user_id,idempotency_key,model,credits,status,created_at) VALUES(?,?,?,?,?,?,?)", (job_id, user["id"], key, request_model.model, credits, "reserved", now()))
         connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user["id"], -credits, "render_reserve", job_id, "生成预扣", now()))
+        connection.execute("UPDATE render_jobs SET result_json=? WHERE id=?", (json.dumps({"rateEvents": rate_events}), job_id))
+    if background is not None:
+        background.add_task(background_generation_job, job_id, request_model, user["id"])
+        with closing(db()) as connection:
+            return generation_job_view(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone())
+    return execute_generation_job(job_id, request_model, user["id"])
+
+
+_generation_job_locks = {}
+_generation_job_lock_guard = threading.Lock()
+
+
+def background_generation_job(*args):
     try:
-        result = render_core.generate(request_model)
+        execute_generation_job(*args)
     except Exception:
+        # The worker persisted its terminal/pending state; the authenticated poll returns it.
+        pass
+
+
+def execute_generation_job(job_id, request_model, user_id, recover=False):
+    with _generation_job_lock_guard:
+        lock = _generation_job_locks.setdefault(job_id, threading.Lock())
+    with lock:
+        return _execute_generation_job(job_id, request_model, user_id, recover)
+
+
+def _execute_generation_job(job_id, request_model, user_id, recover):
+    with closing(db()) as connection:
+        job = connection.execute("SELECT * FROM render_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+    if job["status"] == "succeeded":
+        return json.loads(job["result_json"])
+    if job["status"] == "failed":
+        raise HTTPException(409, "该任务已结束，不能重复执行")
+    rate_events = json.loads(job["result_json"] or "{}").get("rateEvents", [])
+
+    linked = bool(job["run_id"])
+    def on_progress(state):
+        nonlocal linked
+        if not linked:
+            with transaction() as connection:
+                connection.execute("UPDATE render_jobs SET run_id=? WHERE id=? AND run_id IS NULL", (state["runId"], job_id))
+            linked = True
+
+    try:
+        result = render_core.resume_generation(job["run_id"], on_progress) if recover else render_core.generate(request_model, on_progress=on_progress, cache_scope=user_id)
+    except render_core.delivery.DeliveryPending as error:
+        if not recover:
+            raise HTTPException(status_code=503, detail={"message": str(error), "jobId": job_id, "recoverable": True}) from error
+        return None
+    except Exception as error:
+        if recover and isinstance(error, requests.RequestException):
+            state = render_core.delivery.RunProgress(render_core.JOB_STATE_DIR, job["run_id"])
+            state.update("awaiting_recovery", error="原任务查询中断，可继续取图，不会重新生图")
+            return None
         with transaction() as connection:
-            connection.execute("UPDATE render_jobs SET status = 'failed', completed_at = ? WHERE id = ?", (now(), job_id))
-            connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user["id"], credits, "render_refund", job_id, "生成失败自动退款", now()))
+            changed = connection.execute("UPDATE render_jobs SET status='failed',result_json=?,completed_at=? WHERE id=? AND status='reserved'", (json.dumps({"error": str(getattr(error, "detail", error))}, ensure_ascii=False), now(), job_id)).rowcount
+            if changed:
+                connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user_id, job["credits"], "render_refund", job_id, "生成失败自动退款", now()))
         rate_limit.release_rate_limits(rate_events)
         raise
     with transaction() as connection:
         connection.execute("UPDATE render_jobs SET status = 'succeeded', run_id = ?, result_json = ?, completed_at = ? WHERE id = ?", (result.get("runId"), json.dumps(result, ensure_ascii=False), now(), job_id))
     return result
+
+
+def generation_job_view(job):
+    result = json.loads(job["result_json"] or "{}")
+    state = render_core.delivery.RunProgress.read(render_core.JOB_STATE_DIR / f"{job['run_id']}.json") if job["run_id"] else {}
+    public = {name: state[name] for name in ("stage", "startedAt", "updatedAt", "elapsedSeconds", "durations", "reusedImages", "uploadedImages", "downloadedBytes", "downloadAttempt", "error") if name in state}
+    with _generation_job_lock_guard:
+        lock = _generation_job_locks.get(job["id"])
+        active = lock is not None and lock.locked()
+    resumable = bool(job["run_id"] and (state.get("upstreamTaskId") or (render_core.RUN_DIR / job["run_id"] / "response.json").is_file()))
+    queued = state.get("stage") == "recovering" and time.time() - state.get("updatedAt", 0) < 30
+    can_recover = job["status"] == "reserved" and not active and not queued and resumable
+    if can_recover:
+        public["stage"] = "awaiting_recovery"
+    public.update(jobId=job["id"], taskKey=job["idempotency_key"], model=job["model"], status=job["status"], createdAt=job["created_at"], canRecover=can_recover)
+    if job["status"] == "succeeded":
+        public["stage"] = "completed"
+        public["data"] = [{"url": item["url"]} for item in result.get("outputs", [])]
+    elif job["status"] == "failed":
+        public.update(stage="failed", error=result.get("error", "生成失败，本站积分已退回"))
+    return public
+
+
+def owned_generation_job(connection, job_id, user_id):
+    job = connection.execute("SELECT * FROM render_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+    if job is None:
+        raise HTTPException(404, "未找到该生成任务")
+    return job
+
+
+@app.get("/api/generation-jobs")
+def generation_jobs(user=Depends(current_user)):
+    with closing(db()) as connection:
+        rows = connection.execute("SELECT * FROM render_jobs WHERE user_id=? AND run_id IS NOT NULL AND created_at>? AND (status='reserved' OR completed_at>?) ORDER BY (status='reserved') DESC,created_at DESC LIMIT 20", (user["id"], now()-172800, now()-60)).fetchall()
+        return {"items": [generation_job_view(row) for row in rows]}
+
+
+@app.get("/api/generation-jobs/by-key/{task_key}")
+def generation_job_by_key(task_key: str, user=Depends(current_user)):
+    with closing(db()) as connection:
+        job = connection.execute("SELECT * FROM render_jobs WHERE idempotency_key=? AND user_id=?", (task_key, user["id"])).fetchone()
+        if job is None:
+            raise HTTPException(404, "任务尚未登记，可稍后查询；不会自动重新生图")
+        return generation_job_view(job)
+
+
+@app.get("/api/generation-jobs/{job_id}")
+def generation_job(job_id: str, user=Depends(current_user)):
+    with closing(db()) as connection:
+        return generation_job_view(owned_generation_job(connection, job_id, user["id"]))
+
+
+@app.post("/api/generation-jobs/{job_id}/recover")
+def recover_generation_job(job_id: str, background: BackgroundTasks, user=Depends(current_user)):
+    with closing(db()) as connection:
+        job = owned_generation_job(connection, job_id, user["id"])
+        view = generation_job_view(job)
+    if job["status"] == "succeeded":
+        return view
+    if not view["canRecover"]:
+        raise HTTPException(409, "任务仍在处理或不能恢复，请先查询原任务")
+    state = render_core.delivery.RunProgress(render_core.JOB_STATE_DIR, job["run_id"])
+    state.update("recovering", error="")
+    background.add_task(background_generation_job, job_id, None, user["id"], True)
+    return generation_job_view(job)
 
 
 @app.get("/v1/models")
@@ -743,13 +870,18 @@ def commercial_models(user: sqlite3.Row = Depends(current_user)) -> dict[str, An
 def commercial_image_generations(
     req: Request,
     payload: render_core.OpenAIImageGenerationRequest,
+    background_tasks: BackgroundTasks,
     x_idempotency_key: str | None = Header(default=None),
+    prefer: str | None = Header(default=None),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
     try:
         request_model = render_core.openai_generate_request(payload.model, payload.prompt, payload.n, payload.quality, payload.size)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if prefer == "respond-async":
+        result = start_commercial_generation(req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user, background_tasks)
+        return JSONResponse(result, status_code=202)
     result = commercial_generate(req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
     return openai_image_result(result)
 
@@ -757,6 +889,7 @@ def commercial_image_generations(
 @app.post("/v1/images/edits")
 async def commercial_image_edits(
     req: Request,
+    background_tasks: BackgroundTasks,
     image: list[UploadFile] = File(...),
     prompt: str = Form(""),
     model: str = Form(""),
@@ -765,6 +898,7 @@ async def commercial_image_edits(
     size: str = Form("1024x1024"),
     mask: UploadFile | None = File(None),
     x_idempotency_key: str | None = Header(default=None),
+    prefer: str | None = Header(default=None),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
     images: list[render_core.GenerateImage] = []
@@ -783,6 +917,9 @@ async def commercial_image_edits(
         request_model = render_core.openai_generate_request(model, prompt, n, quality, size, images)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if prefer == "respond-async":
+        result = await run_in_threadpool(start_commercial_generation, req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user, background_tasks)
+        return JSONResponse(result, status_code=202)
     result = await run_in_threadpool(commercial_generate, req, CommercialGeneratePayload(request=request_model.model_dump(by_alias=True), idempotencyKey=x_idempotency_key or uuid.uuid4().hex), user)
     return openai_image_result(result)
 
