@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import requests
 import render_delivery as delivery
+import render_routes as routes
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -85,6 +86,8 @@ PROVIDER_LABELS = {
 
 SUPPORTED_IMAGE_MODELS = (
     "gpt-image-2.5",
+    "gpt-image-2.5-sunburst",
+    routes.FAST_MODEL,
     "nano-banana-2",
     "nano-banana-fast",
     "nano-banana-pro",
@@ -223,6 +226,7 @@ def toapis_image_model(model: str) -> str:
         "gpt-image-2.5": "gpt-image-2.5-flare",
         "gpt-image-2.5-flare": "gpt-image-2.5-flare",
         "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
+        routes.FAST_MODEL: "gpt-image-2.5-flare-official",
         "nano-banana-2": "gemini-3.1-flash-image-preview",
         "nano-banana-pro": "gemini-3-pro-image-preview",
         "nano-banana-fast": "gemini-3.1-flash-image-preview",
@@ -399,6 +403,10 @@ def validate_output_resolution(req: GenerateRequest, target: Path, provider: str
         image.load()
         width, height = image.size
     tier = toapis_resolution_tier(req.image_size)
+    if req.model == routes.FAST_MODEL:
+        expected = routes.FAST_SIZES[toapis_image_aspect_ratio("gpt-image-2.5-flare", req.aspect_ratio)]
+        if width < expected[0]*.95 or height < expected[1]*.95:
+            raise ValueError(f"快速预览未返回所选 2K：实际 {width}×{height}px")
     if provider == "toapis" and tier != "1K":
         if toapis_image_model(req.model) in TOAPIS_TOP_LEVEL_RESOLUTION_MODELS:
             ratio = toapis_image_aspect_ratio(req.model, req.aspect_ratio)
@@ -944,6 +952,7 @@ def call_toapis(
     client = toapis_http_client()
 
     # Build payload. toapis accepts http(s) URLs only for image inputs; upload local files first.
+    routes.validate_fast_request(req, prompt)
     image_urls: list[str] = []
     if progress:
         progress.update("uploading")
@@ -952,6 +961,8 @@ def call_toapis(
             continue
         path = Path(item["file"])
         mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
+        if req.model == routes.FAST_MODEL:
+            path, mime = routes.fast_input(path), "image/jpeg"
         image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client))
 
     metadata: dict[str, Any] = {}
@@ -988,6 +999,12 @@ def call_toapis(
     image_field = "reference_images" if payload_resolution else "image_urls"
     if image_urls:
         payload[image_field] = image_urls
+    if req.model == routes.FAST_MODEL:
+        width, height = routes.FAST_SIZES[toapis_image_aspect_ratio("gpt-image-2.5-flare", req.aspect_ratio)]
+        payload = {"model": model, "prompt": prompt, "size": f"{width}x{height}", "quality": "medium", "n": 1}
+        image_field = "image_urls"
+        if image_urls:
+            payload[image_field] = image_urls
     if mask_path and model == "gpt-image-2":
         payload["mask_url"] = toapis_upload_image(api_base, api_key, mask_path, "image/png", client)
     elif mask_path:
@@ -1002,7 +1019,7 @@ def call_toapis(
         )
 
     last_error = ""
-    attempts = 1 if mask_path else TOAPIS_IMAGE_RETRY_ATTEMPTS
+    attempts = 1 if mask_path or req.model == routes.FAST_MODEL else TOAPIS_IMAGE_RETRY_ATTEMPTS
     for attempt in range(1, attempts + 1):
         if progress:
             progress.update("submitting")
@@ -1060,6 +1077,8 @@ def call_toapis(
                         "status": "succeeded",
                         "data": [{"url": url} for url in urls],
                         "expiresAt": result_data.get("expires_at"),
+                        "billing": result_data.get("billing"),
+                        "usage": result_data.get("usage"),
                     }
                 last_error = "toapis image task completed without an image URL."
                 if progress:
@@ -1665,6 +1684,7 @@ def upload_data_url(data_url: str = Form(...), name: str = Form("clipboard.png")
 def generate(req: GenerateRequest, on_progress=None, cache_scope="") -> dict[str, Any]:
     if not is_video_model(req.model):
         req.image_size = resolve_image_quality(req.image_size, req.requested_size)
+    routes.validate_fast_request(req)
     # Provider resolution. When TOAPIS_API_KEY is configured it is the active relay:
     # route every image model through toapis (unless the caller explicitly pinned a
     # non-default provider). Otherwise infer banana vs gpt by model name.
@@ -1795,6 +1815,9 @@ def save_generation_outputs(req: GenerateRequest, run_id: str, api_response: dic
                             saved_inputs: list[dict[str, Any]], provider: str, progress: delivery.RunProgress) -> dict[str, Any]:
     run_path = RUN_DIR / run_id
     remote_urls = result_urls(api_response)
+    if req.model == routes.FAST_MODEL and routes.settled_cost(api_response) is None:
+        progress.update("awaiting_recovery", error="原图任务已完成，等待上游费用结算；继续取图不会重新生图")
+        raise delivery.DeliveryPending(run_id, "原任务待结算，可继续查询，不会重新生图")
     outputs, download_errors, validation_errors = [], [], []
     progress.update("downloading")
     for index, url in enumerate(remote_urls, start=1):
@@ -1843,6 +1866,8 @@ def save_generation_outputs(req: GenerateRequest, run_id: str, api_response: dic
         raise delivery.DeliveryPending(run_id, "已生成，原图传输中断；请继续取图，不会重新生图或再次扣费")
     result = {"ok": True, "runId": run_id, "status": "succeeded", "outputs": outputs,
               "remoteUrls": remote_urls, "errors": [], "message": "generated"}
+    if req.model == routes.FAST_MODEL:
+        result["billing"] = api_response["billing"]
     (run_path / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
     progress.update("completed", error="")
     return result
@@ -1862,7 +1887,9 @@ def resume_generation(run_id: str, on_progress=None) -> dict[str, Any]:
     if response_path.is_file():
         response = json.loads(response_path.read_text(encoding="utf-8"))
     else:
-        task_id = progress.data.get("upstreamTaskId")
+        response = None
+    if response is None or (req.model == routes.FAST_MODEL and routes.settled_cost(response) is None):
+        task_id = progress.data.get("upstreamTaskId") or (response or {}).get("id")
         if not task_id or req.provider != "toapis":
             progress.update("awaiting_recovery", error="原任务结果尚未确认，已停止自动重新生成")
             raise delivery.DeliveryPending(run_id, "原任务结果尚未确认，已停止自动重新生成")
@@ -1882,7 +1909,7 @@ def resume_generation(run_id: str, on_progress=None) -> dict[str, Any]:
                 if not urls:
                     progress.update("awaiting_recovery", error="上游已完成，等待原图地址；可继续取图")
                     raise delivery.DeliveryPending(run_id, "上游已完成，等待原图地址；可继续取图")
-                response = {"id": task_id, "status": "succeeded", "data": [{"url": url} for url in urls]}
+                response = {"id": task_id, "status": "succeeded", "data": [{"url": url} for url in urls], "billing": data.get("billing"), "usage": data.get("usage")}
                 response_path.write_text(json.dumps(response), encoding="utf-8")
                 break
             if status in {"failed", "error", "cancelled", "canceled"}:

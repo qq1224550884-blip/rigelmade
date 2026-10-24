@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
+import { imageAspectRatio, imageSizeForQuality } from "@/lib/image-resolution";
 
 export type ApiCallFormat = "openai" | "gemini" | "ark";
 export type ModelCapability = "image" | "video" | "text" | "audio";
@@ -71,6 +72,8 @@ const LOCAL_WORKBENCH_BASE_URL = typeof window === "undefined"
     : window.location.origin;
 const LOCAL_WORKBENCH_MODELS: ChannelModel[] = [
     { name: "gpt-image-2.5", capability: "image" },
+    { name: "gpt-image-2.5-fast", capability: "image" },
+    { name: "gpt-image-2.5-sunburst", capability: "image" },
     { name: "nano-banana-2", capability: "image" },
     { name: "nano-banana-fast", capability: "image" },
     { name: "nano-banana-pro", capability: "image" },
@@ -218,6 +221,7 @@ export const useConfigStore = create<ConfigStore>()(
                     config: {
                         ...state.config,
                         [key]: value,
+                        ...((key === "model" || key === "imageModel") && typeof value === "string" ? fastPreviewPatch(value, state.config.size) : {}),
                     },
                 })),
             updateWebdavConfig: (key, value) =>
@@ -299,14 +303,24 @@ export function modelOptionName(value: string) {
     return decodeChannelModel(value)?.model || value;
 }
 
+export function isFastPreviewModel(value: string) {
+    return modelOptionName(value) === "gpt-image-2.5-fast";
+}
+
+export function fastPreviewPatch(model: string, size = "1:1") {
+    return isFastPreviewModel(model) ? { quality: "medium", size: imageSizeForQuality("medium", imageAspectRatio(size) === "auto" ? "1:1" : imageAspectRatio(size)) } : {};
+}
+
 export function modelOptionLabel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
-    if (!decoded) return value;
+    const labels: Record<string, string> = { "gpt-image-2.5": "GPT 2.5 · 日常 Flare", "gpt-image-2.5-fast": "GPT 2.5 · 快速预览（2K）", "gpt-image-2.5-sunburst": "GPT 2.5 · 精修 Sunburst" };
+    const label = labels[decoded?.model || value] || decoded?.model || value;
+    if (!decoded) return label;
     const channel = config.channels.find((item) => item.id === decoded.channelId);
-    if (!channel) return decoded.model;
+    if (!channel) return label;
     const sameNameChannels = config.channels.filter((item) => item.models.some((model) => model.name === decoded.model));
-    if (sameNameChannels.length <= 1) return decoded.model;
-    return `${decoded.model}（${channel.name}）`;
+    if (sameNameChannels.length <= 1) return label;
+    return `${label}（${channel.name}）`;
 }
 
 export function modelOptionsFromChannels(channels: ModelChannel[]) {

@@ -16,6 +16,7 @@ export type GenerationJob = {
     reusedImages?: number;
     canRecover?: boolean;
     error?: string;
+    creditsCharged?: number;
     data?: Array<{ url: string }>;
 };
 

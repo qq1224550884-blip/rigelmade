@@ -39,6 +39,7 @@ export function GenerationProgress() {
                     void recoverGenerationImage(job.taskKey).catch(() => {}).finally(() => setRecovering((keys) => keys.filter((key) => key !== job.taskKey)));
                 }}>继续取图</Button></div> : null}
                 {job.stage === "completed" ? job.data?.map((image, index) => <a className="mr-3 inline-flex items-center gap-1 text-xs underline" key={image.url} href={image.url} download><Download className="size-3" />下载原图{job.data!.length > 1 ? index + 1 : ""}</a>) : null}
+                {job.stage === "completed" && job.creditsCharged != null ? <div className="text-xs" style={{ color: token.colorTextSecondary }}>实际扣分 {job.creditsCharged} 积分</div> : null}
             </div>;
         })}
     </aside>;

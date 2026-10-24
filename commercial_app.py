@@ -449,7 +449,7 @@ def catalog_pricing(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]
     connection = db()
     try:
         rows = connection.execute("SELECT model,quality,credits FROM model_prices WHERE active = 1 ORDER BY model,quality").fetchall()
-        return {"prices": [{"model": row["model"], "quality": row["quality"], "credits": row["credits"]} for row in rows]}
+        return {"prices": [{"model": row["model"], "quality": row["quality"], "credits": row["credits"], "billingMode": "usage" if row["model"] == render_core.routes.FAST_MODEL else "fixed"} for row in rows]}
     finally:
         connection.close()
 
@@ -687,6 +687,7 @@ def start_commercial_generation(request: Request, payload: CommercialGeneratePay
     key = payload.idempotency_key.strip()
     if not render_core.is_video_model(request_model.model):
         request_model.image_size = render_core.resolve_image_quality(request_model.image_size, request_model.requested_size)
+    render_core.routes.validate_fast_request(request_model)
     if not key or len(key) > 120:
         raise HTTPException(status_code=400, detail="缺少有效的幂等请求编号。")
     with transaction() as connection:
@@ -790,8 +791,12 @@ def _execute_generation_job(job_id, request_model, user_id, recover):
                 connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user_id, job["credits"], "render_refund", job_id, "生成失败自动退款", now()))
         rate_limit.release_rate_limits(rate_events)
         raise
+    charged = render_core.routes.preview_credits(result, job["credits"]) if job["model"] == render_core.routes.FAST_MODEL else job["credits"]
+    result["creditsCharged"] = charged
     with transaction() as connection:
-        connection.execute("UPDATE render_jobs SET status = 'succeeded', run_id = ?, result_json = ?, completed_at = ? WHERE id = ?", (result.get("runId"), json.dumps(result, ensure_ascii=False), now(), job_id))
+        changed = connection.execute("UPDATE render_jobs SET status='succeeded',credits=?,run_id=?,result_json=?,completed_at=? WHERE id=? AND status='reserved'", (charged, result.get("runId"), json.dumps(result, ensure_ascii=False), now(), job_id)).rowcount
+        if changed and charged < job["credits"]:
+            connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, user_id, job["credits"]-charged, "render_settlement", job_id, "快速预览按实际用量结算，退回预扣差额", now()))
     return result
 
 
@@ -810,6 +815,7 @@ def generation_job_view(job):
     public.update(jobId=job["id"], taskKey=job["idempotency_key"], model=job["model"], status=job["status"], createdAt=job["created_at"], canRecover=can_recover)
     if job["status"] == "succeeded":
         public["stage"] = "completed"
+        public["creditsCharged"] = job["credits"]
         public["data"] = [{"url": item["url"]} for item in result.get("outputs", [])]
     elif job["status"] == "failed":
         public.update(stage="failed", error=result.get("error", "生成失败，本站积分已退回"))

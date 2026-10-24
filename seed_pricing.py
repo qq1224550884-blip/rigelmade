@@ -41,6 +41,9 @@ OBSOLETE_PRODUCT_IDS = (
 # 图片模型定价（积分/张，×1.5 向上取整），键为 model，值为 {resolution: credits}
 IMAGE_PRICES = {
     "gpt-image-2.5": {"1K": 5, "2K": 6, "4K": 8},
+    "gpt-image-2.5-sunburst": {"1K": 5, "2K": 6, "4K": 8},
+    # 快速预览仅开放已实测的 2K：24 为预扣上限，最终按上游 USD × 300 向上取整退差额。
+    "gpt-image-2.5-fast": {"2K": 24},
     "nano-banana-2": {"1K": 9, "2K": 12, "4K": 18},
     "nano-banana-fast": {"1K": 9, "2K": 12, "4K": 18},
     "nano-banana-pro": {"1K": 18, "2K": 18, "4K": 18},
@@ -84,6 +87,8 @@ def main() -> None:
         # 图片模型：按分辨率档写入 model_prices（quality 列存 1K/2K/4K 直接可查）
         for model, by_resolution in IMAGE_PRICES.items():
             for quality, resolution in QUALITY_TO_RESOLUTION.items():
+                if resolution not in by_resolution:
+                    continue
                 credits = by_resolution[resolution]
                 connection.execute(
                     """INSERT INTO model_prices(model,quality,credits,active,updated_at) VALUES(?,?,?,?,?)

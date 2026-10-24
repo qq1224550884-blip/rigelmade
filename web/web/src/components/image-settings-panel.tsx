@@ -2,7 +2,7 @@ import { type ReactNode, useState } from "react";
 import { ConfigProvider, Switch } from "antd";
 
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import type { AiConfig } from "@/stores/use-config-store";
+import { isFastPreviewModel, type AiConfig } from "@/stores/use-config-store";
 import { usePricing } from "@/services/pricing";
 import { imageAspectRatio, imageSizeForQuality, resolveImageQuality } from "@/lib/image-resolution";
 
@@ -44,6 +44,7 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
     const quality = resolveImageQuality(config.quality || "auto", config.size || "auto");
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
     const imageModel = (config.model || config.imageModel || "").includes("::") ? config.model.split("::")[1] || config.model : config.model || config.imageModel || "";
+    const fastPreview = isFastPreviewModel(imageModel);
     const estimatedCredits = estimateImageCredits(imageModel, quality, count);
     const activeSize = config.size || "auto";
     const transparentBackground = config.background === "transparent";
@@ -78,13 +79,14 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                 <div className="space-y-2.5">
                     <SettingTitle color={theme.node.muted}>输出分辨率</SettingTitle>
                     <div className="grid grid-cols-4 gap-2.5">
-                        {qualityOptions.map((item) => (
+                        {qualityOptions.filter((item) => !fastPreview || item.value === "medium").map((item) => (
                             <OptionPill key={item.value} selected={quality === item.value} theme={theme} onClick={() => selectQuality(item.value)}>
                                 {item.label}
                             </OptionPill>
                         ))}
                     </div>
                     <div className="text-xs leading-5" style={{ color: theme.node.muted }}>按像素档位出图；实际尺寸随模型和比例变化，文件 MB 大小不代表分辨率。</div>
+                    {fastPreview ? <div className="text-xs leading-5" style={{ color: theme.node.muted }}>快速预览支持 2K、最多一张底图；多图、涂鸦或 4K 请选日常或精修。底图会归一为约 2K 输入。</div> : null}
                 </div>
                 <div className="space-y-2.5">
                     <div className="flex items-center justify-between gap-3">
@@ -99,9 +101,9 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         </div>
                     </div>
                     <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
-                        <DimensionInput prefix="W" value={dimensions.width} disabled={activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
+                        <DimensionInput prefix="W" value={dimensions.width} disabled={fastPreview || activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
                         <span className="text-lg opacity-45">↔</span>
-                        <DimensionInput prefix="H" value={dimensions.height} disabled={activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
+                        <DimensionInput prefix="H" value={dimensions.height} disabled={fastPreview || activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
                     </div>
                 </div>
                 <div className="space-y-2.5">
@@ -149,7 +151,7 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                     style={{ borderColor: theme.node.stroke, background: "transparent" }}
                 >
                     <span className="text-sm font-medium" style={{ color: theme.node.muted }}>
-                        预计消耗积分
+                        {fastPreview ? "预扣积分上限" : "预计消耗积分"}
                     </span>
                     {pricingLoading ? (
                         <span className="text-sm" style={{ color: theme.node.text }}>
@@ -166,6 +168,7 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         </span>
                     )}
                 </div>
+                {fastPreview ? <div className="text-xs leading-5" style={{ color: theme.node.muted }}>完成后按实际用量结算，多余预扣自动退回，单张最多扣 24 积分。</div> : null}
             </div>
         </ImageSettingsTheme>
     );

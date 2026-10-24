@@ -10,7 +10,7 @@ import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
-import { modelOptionLabel, modelOptionName, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { isFastPreviewModel, modelOptionLabel, modelOptionName, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -514,7 +514,7 @@ export default function ImagePage() {
 
                         <div className="mt-auto space-y-2 pt-6">
                             <div className="flex items-center justify-between text-xs text-stone-500 dark:text-stone-400">
-                                <span>{unitCost ? `消耗 ${unitCost} 积分/张 × ${generationCount} = ${totalCost} 积分` : "积分消耗加载中"}</span>
+                                <span>{unitCost ? isFastPreviewModel(model) ? `预扣上限 ${totalCost} 积分，按实际用量退差额` : `消耗 ${unitCost} 积分/张 × ${generationCount} = ${totalCost} 积分` : "积分消耗加载中"}</span>
                                 <span>余额 {balance} 积分</span>
                             </div>
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
@@ -597,7 +597,7 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
                 <ModelPicker config={config} value={model} onChange={(value) => updateConfig("imageModel", value)} capability="image" fullWidth onMissingConfig={() => openConfigDialog(false)} />
             </label>
             <div className="col-span-2">
-                <ImageSettingsPanel config={config} onConfigChange={(key, value) => updateConfig(key, value)} theme={theme} showTitle={false} className="space-y-4" maxCount={10} />
+                <ImageSettingsPanel config={{ ...config, model }} onConfigChange={(key, value) => updateConfig(key, value)} theme={theme} showTitle={false} className="space-y-4" maxCount={10} />
             </div>
         </>
     );
