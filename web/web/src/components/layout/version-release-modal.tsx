@@ -1,7 +1,9 @@
 import type { CSSProperties } from "react";
-import { Modal, Tag, Timeline } from "antd";
+import { Button, Modal, Tabs, Tag, Timeline, theme } from "antd";
+import { Megaphone } from "lucide-react";
 import { useVersionCheck } from "@/hooks/use-version-check";
 import { APP_VERSION } from "@/constant/env";
+import { WORKBENCH_ANNOUNCEMENT as announcement } from "@/constant/workbench-announcement";
 
 function getTagColor(type: string) {
     if (type === "新增") return "green";
@@ -18,46 +20,50 @@ function getReleaseTitle(version: string) {
 type VersionReleaseModalProps = {
     className?: string;
     style?: CSSProperties;
+    compact?: boolean;
 };
 
-export function VersionReleaseModal({ className, style }: VersionReleaseModalProps) {
-    const { open, setOpen, openReleaseModal, latestVersion, releases, checking, hasNewVersion, checkLatestRelease } = useVersionCheck();
+export function VersionReleaseModal({ className, style, compact = false }: VersionReleaseModalProps) {
+    const { open, setOpen, openReleaseModal, latestVersion, releases, hasNewVersion } = useVersionCheck();
+    const { token } = theme.useToken();
 
     return (
         <>
             <button
                 type="button"
-                className={className || "shrink-0 cursor-pointer text-xs font-medium text-stone-500 transition hover:text-stone-950 dark:text-stone-400 dark:hover:text-white"}
+                className={className || "inline-flex shrink-0 cursor-pointer items-center gap-1 p-1 text-xs font-medium text-stone-500 transition hover:text-stone-950 dark:text-stone-400 dark:hover:text-white"}
                 style={style}
                 onClick={openReleaseModal}
-                title="查看版本更新"
+                title={`更新公告 · ${APP_VERSION}`}
+                aria-label="更新公告"
             >
-                <span className="relative inline-flex">
-                    {APP_VERSION}
+                <span className="relative inline-flex items-center gap-1">
+                    <Megaphone className="size-4" />
+                    <span className={compact ? "hidden" : "hidden sm:inline"}>更新公告</span>
                     {hasNewVersion ? <span className="absolute -right-1.5 -top-1 size-1.5 rounded-full bg-green-500" /> : null}
                 </span>
             </button>
-            <Modal title="版本更新" open={open} width={680} centered footer={null} onCancel={() => setOpen(false)}>
-                <div className="mb-5 grid grid-cols-2 gap-3">
-                    <div className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
-                        <div className="text-xs text-stone-500 dark:text-stone-400">当前版本</div>
-                        <div className="mt-1 text-base font-semibold text-stone-950 dark:text-stone-100">{APP_VERSION}</div>
-                    </div>
-                    <div className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
-                        <div className="flex items-center justify-between gap-3">
-                            <div className="text-xs text-stone-500 dark:text-stone-400">最新版本</div>
-                            <button
-                                type="button"
-                                className="cursor-pointer bg-transparent p-0 text-[11px] font-normal text-stone-400 underline-offset-2 transition hover:text-stone-700 hover:underline dark:text-stone-500 dark:hover:text-stone-300"
-                                onClick={() => void checkLatestRelease(true)}
-                            >
-                                {checking ? "检查中..." : "检查更新"}
-                            </button>
-                        </div>
-                        <div className="mt-1 text-base font-semibold text-stone-950 dark:text-stone-100">{latestVersion}</div>
-                    </div>
-                </div>
-                <div className="max-h-[56vh] overflow-y-auto pr-2">
+            <Modal title="工作台更新公告" open={open} width={760} centered destroyOnHidden footer={<Button onClick={() => setOpen(false)}>知道了</Button>} onCancel={() => setOpen(false)} styles={{ body: { maxHeight: "70dvh", overflowY: "auto" } }}>
+                <Tabs defaultActiveKey="announcement" items={[
+                    { key: "announcement", label: "更新公告", children: <article className="space-y-5 pb-2" aria-label="专业效果图工作台升级公告">
+                        <header>
+                            <h2 className="m-0 text-xl font-semibold leading-snug">{announcement.title}</h2>
+                            <div className="mt-2 text-xs" style={{ color: token.colorTextSecondary }}>2026年11月1日 · 当前版本 {APP_VERSION}</div>
+                            <p className="mb-0 mt-4 text-sm leading-7">{announcement.summary}</p>
+                        </header>
+                        {announcement.sections.map((section) => <section key={section.title}>
+                            <h3 className="m-0 text-base font-semibold">{section.title}</h3>
+                            <p className="mb-0 mt-1.5 text-sm leading-7" style={{ color: token.colorTextSecondary }}>{section.content}</p>
+                        </section>)}
+                        <p className="text-sm leading-7">{announcement.note}</p>
+                        <p className="text-sm leading-7" style={{ color: token.colorTextSecondary }}>{announcement.usage}</p>
+                        <footer className="space-y-1 border-t pt-4 text-right text-sm" style={{ borderColor: token.colorBorderSecondary }}>
+                            <div>{announcement.signature}</div>
+                            <time dateTime={announcement.publishedAt} className="block text-xs" style={{ color: token.colorTextSecondary }}>{announcement.publishedTime}</time>
+                        </footer>
+                    </article> },
+                    { key: "history", label: "版本记录", children: <div>
+                    <p className="mb-5 text-sm" style={{ color: token.colorTextSecondary }}>当前版本 {APP_VERSION}</p>
                     <Timeline
                         items={releases.map((release) => ({
                             content: (
@@ -84,7 +90,9 @@ export function VersionReleaseModal({ className, style }: VersionReleaseModalPro
                             ),
                         }))}
                     />
-                </div>
+                    {!releases.length ? <p className="text-sm" style={{ color: token.colorTextSecondary }}>暂无版本记录，可在「更新公告」查看本次升级内容。</p> : null}
+                    </div> },
+                ]} />
             </Modal>
         </>
     );
