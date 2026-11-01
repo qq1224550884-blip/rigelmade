@@ -54,6 +54,7 @@ export type CanvasNodeMetadata = {
     referenceOrder?: string[];
     referenceRolesByIndex?: import("./image").ImageReferenceRole[];
     annotationNotes?: string;
+    annotationPlan?: import("./image").AnnotationPlan;
     editMaskStorageKey?: string;
     annotationLockOutside?: boolean;
     annotations?: Array<{ id: string; x: number; y: number; width: number; height: number; text: string }>;

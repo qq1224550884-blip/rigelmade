@@ -271,7 +271,8 @@ def openai_image_result(result: dict[str, Any]) -> dict[str, Any]:
             items.append({"url": str(output["url"])})
     if not items:
         raise HTTPException(status_code=502, detail=result.get("message") or "生图服务没有返回图片。")
-    return {"created": now(), "data": items, "runId": run_id, "status": result.get("status", "succeeded")}
+    return {"created": now(), "data": items, "runId": run_id, "status": result.get("status", "succeeded"),
+            **({"annotationPlan": result["annotationPlan"]} if result.get("annotationPlan") else {})}
 
 
 class RegisterPayload(BaseModel):
@@ -362,6 +363,27 @@ def create_wechat_native_order(order: sqlite3.Row) -> str:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    refund_interrupted_annotation_jobs()
+
+
+def refund_interrupted_annotation_jobs() -> None:
+    """On restart, settle annotation reads that never submitted an image task."""
+    with transaction() as connection:
+        jobs = connection.execute("SELECT * FROM render_jobs WHERE status='reserved' AND run_id IS NOT NULL").fetchall()
+        for job in jobs:
+            state = render_core.delivery.RunProgress.read(render_core.JOB_STATE_DIR / f"{job['run_id']}.json")
+            if state.get("stage") not in {"reading_annotations", "annotations_ready", "uploading"}:
+                continue
+            if state.get("stage") == "uploading" and not state.get("annotationPlan"):
+                continue
+            if state.get("upstreamTaskId") or (render_core.RUN_DIR / job["run_id"] / "response.json").exists():
+                continue
+            error = "批注读取后服务中断，尚未提交生图；本站积分已退回，请重新提交"
+            changed = connection.execute("UPDATE render_jobs SET status='failed',result_json=?,completed_at=? WHERE id=? AND status='reserved'",
+                                         (json.dumps({"error": error}, ensure_ascii=False), now(), job["id"])).rowcount
+            if changed:
+                connection.execute("INSERT INTO credit_ledger(id,user_id,delta,reason,reference_id,note,created_at) VALUES(?,?,?,?,?,?,?)",
+                                   (uuid.uuid4().hex, job["user_id"], job["credits"], "render_refund", job["id"], "批注任务中断退款", now()))
 
 
 @app.get("/api/config")
@@ -803,7 +825,7 @@ def _execute_generation_job(job_id, request_model, user_id, recover):
 def generation_job_view(job):
     result = json.loads(job["result_json"] or "{}")
     state = render_core.delivery.RunProgress.read(render_core.JOB_STATE_DIR / f"{job['run_id']}.json") if job["run_id"] else {}
-    public = {name: state[name] for name in ("stage", "startedAt", "updatedAt", "elapsedSeconds", "durations", "reusedImages", "uploadedImages", "downloadedBytes", "downloadAttempt", "error") if name in state}
+    public = {name: state[name] for name in ("stage", "startedAt", "updatedAt", "elapsedSeconds", "durations", "reusedImages", "uploadedImages", "downloadedBytes", "downloadAttempt", "error", "annotationPlan") if name in state}
     with _generation_job_lock_guard:
         lock = _generation_job_locks.get(job["id"])
         active = lock is not None and lock.locked()
@@ -814,6 +836,8 @@ def generation_job_view(job):
         public["stage"] = "awaiting_recovery"
     public.update(jobId=job["id"], taskKey=job["idempotency_key"], model=job["model"], status=job["status"], createdAt=job["created_at"], canRecover=can_recover)
     if job["status"] == "succeeded":
+        if result.get("annotationPlan"):
+            public["annotationPlan"] = result["annotationPlan"]
         public["stage"] = "completed"
         public["creditsCharged"] = job["credits"]
         public["data"] = [{"url": item["url"]} for item in result.get("outputs", [])]

@@ -2,6 +2,7 @@ import axios from "axios";
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import { commercialRequest } from "@/services/commercial-auth";
+import type { AnnotationPlan } from "@/types/image";
 
 export type GenerationJob = {
     jobId?: string;
@@ -18,6 +19,7 @@ export type GenerationJob = {
     error?: string;
     creditsCharged?: number;
     data?: Array<{ url: string }>;
+    annotationPlan?: AnnotationPlan;
 };
 
 export const useGenerationJobs = create<{ jobs: Record<string, GenerationJob>; update: (job: GenerationJob) => void; clear: () => void }>((set) => ({
@@ -56,7 +58,7 @@ async function waitForJob(taskKey: string, signal?: AbortSignal, stopOnPending =
             continue;
         }
         if (job.status === "failed") throw new GenerationJobError(job.error || "生成失败，本站积分已退回", taskKey, false);
-        if (job.status === "succeeded" && job.data?.length) return { data: job.data };
+        if (job.status === "succeeded" && job.data?.length) return { data: job.data, annotationPlan: job.annotationPlan };
         if (job.canRecover && stopOnPending) throw new GenerationJobError(job.error || "取图暂未完成，可继续重试原图下载", taskKey);
         // Await a deliberate recover action after automatic download retries are exhausted.
         await new Promise((resolve) => setTimeout(resolve, job.canRecover ? 2000 : 1000));

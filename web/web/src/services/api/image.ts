@@ -6,7 +6,7 @@ import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
-import type { ReferenceImage } from "@/types/image";
+import type { ReferenceImage, AnnotationPlan, GeneratedImage } from "@/types/image";
 import { resolveImageQuality } from "@/lib/image-resolution";
 import { GenerationJobError, isWorkbenchImageApi, recoverGenerationImage, requestWorkbenchImage } from "@/services/generation-jobs";
 
@@ -70,6 +70,7 @@ type ResponseApiPayload = {
 type ResponseStreamState = { buffer: string; text: string; payload?: ResponseApiPayload; error?: string };
 
 type ImageApiResponse = {
+    annotationPlan?: AnnotationPlan;
     data?: Array<Record<string, unknown>>;
     error?: { message?: string };
     code?: number;
@@ -255,7 +256,7 @@ function parseImagePayload(payload: ImageApiResponse) {
         imageList
             .map(resolveImageDataUrl)
             .filter((value): value is string => Boolean(value))
-            .map((dataUrl) => ({ id: nanoid(), dataUrl }));
+            .map((dataUrl) => ({ id: nanoid(), dataUrl, annotationPlan: payload.annotationPlan }));
 
     if (images.length === 0) {
         // 尝试检查是否有返回了但格式不被识别的数据
@@ -770,7 +771,7 @@ function collectGeminiImageValues(payload: GeminiPayload): string[] {
     return values;
 }
 
-export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
+export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions): Promise<GeneratedImage[]> {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const script = resolveModelScript(config, config.model || config.imageModel);
@@ -826,7 +827,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     }
 }
 
-export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
+export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions): Promise<GeneratedImage[]> {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     if (requestConfig.model === "gpt-image-2.5-fast" && (references.length > 1 || references.some((image) => image.role === "annotation"))) throw new Error("快速预览仅支持一张底图。批注图和多参考图请先改选日常 Flare 或 Sunburst 精修，尚未提交生成请求。");
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));

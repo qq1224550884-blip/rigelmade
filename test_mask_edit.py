@@ -27,7 +27,7 @@ class MaskEditTests(unittest.TestCase):
             'status': 'completed', 'result': {'data': [{'url': 'https://example.test/result.png'}]}})
         with patch.object(core, 'resolve_toapis_base_url', return_value='https://example.test'), \
              patch.object(core, 'toapis_http_client', return_value=client), \
-             patch.object(core, 'toapis_upload_image', side_effect=lambda a, k, p, m, c: 'https://example.test/' + p.name), \
+             patch.object(core, 'toapis_upload_image', side_effect=lambda a, k, p, m, c, **kw: 'https://example.test/' + p.name), \
              patch.object(core.time, 'sleep'):
             core.call_toapis(core.GenerateRequest(model='gpt-image-2'), 'edit', self.files, 'test', '')
         payload = client.post.call_args.kwargs['json']
@@ -73,7 +73,7 @@ class MaskEditTests(unittest.TestCase):
             'status': 'completed', 'result': {'data': [{'url': 'https://example.test/result.png'}]}})
         with patch.object(core, 'resolve_toapis_base_url', return_value='https://example.test'), \
              patch.object(core, 'toapis_http_client', return_value=client), \
-             patch.object(core, 'toapis_upload_image', side_effect=lambda a, k, p, m, c: 'https://example.test/' + p.name), \
+             patch.object(core, 'toapis_upload_image', side_effect=lambda a, k, p, m, c, **kw: 'https://example.test/' + p.name), \
              patch.object(core.time, 'sleep'):
             core.call_toapis(core.GenerateRequest(model='gpt-image-2.5-sunburst'), 'edit', self.files, 'test', '')
         payload = client.post.call_args.kwargs['json']

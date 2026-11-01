@@ -19,6 +19,7 @@ from uuid import uuid4
 import requests
 import render_delivery as delivery
 import render_routes as routes
+import render_annotations as annotations
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -799,17 +800,18 @@ def call_gemini_native(
     }
 
 
-def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
-    return delivery.cached_upload(api_base, api_key, path, mime,
-                                  lambda: _toapis_upload_image(api_base, api_key, path, mime, client))
+def toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session, preserve_details=False) -> str:
+    cache_mime = mime + (":annotation-v1" if preserve_details else "")
+    return delivery.cached_upload(api_base, api_key, path, cache_mime,
+                                  lambda: _toapis_upload_image(api_base, api_key, path, mime, client, preserve_details))
 
 
-def _toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session) -> str:
+def _toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, client: requests.Session, preserve_details=False) -> str:
     """Upload a local image to toapis and return its public URL.
 
     ToAPIs 上传上限为 10MB，超限参考图在上传前自动压缩（重编码为 JPEG）。
     """
-    compressed = compress_upload_image(path, mime)
+    compressed = compress_upload_image(path, mime, preserve_details)
     if compressed is None:
         with path.open("rb") as handle:
             response = client.post(
@@ -836,7 +838,7 @@ def _toapis_upload_image(api_base: str, api_key: str, path: Path, mime: str, cli
     return str(url)
 
 
-def compress_upload_image(path: Path, mime: str) -> tuple[io.BytesIO, str, str] | None:
+def compress_upload_image(path: Path, mime: str, preserve_details=False) -> tuple[io.BytesIO, str, str] | None:
     """Return (bytes, filename, mime) when the image must be compressed, else None.
 
     文件超过上传上限或最长边超过 4096px 时触发；用 Pillow 重编码为 JPEG，
@@ -850,15 +852,16 @@ def compress_upload_image(path: Path, mime: str) -> tuple[io.BytesIO, str, str] 
         with Image.open(path) as source:
             if path.stat().st_size <= TOAPIS_UPLOAD_MAX_BYTES and max(source.size) <= 4096:
                 return None
-            source.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+            edge = 4096 if preserve_details else 2048
+            source.thumbnail((edge, edge), Image.Resampling.LANCZOS)
             image = source.copy()
     except Exception as exc:
         raise RuntimeError(f"参考图无法读取：{exc}") from exc
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
-    for quality in (88, 78, 68, 55):
+    for quality in ((96, 92, 88, 80) if preserve_details else (88, 78, 68, 55)):
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        image.save(buffer, format="JPEG", quality=quality, optimize=True, **({"subsampling": 0} if preserve_details else {}))
         if buffer.tell() <= TOAPIS_UPLOAD_MAX_BYTES:
             return buffer, "upload.jpg", "image/jpeg"
     raise RuntimeError("参考图压缩后仍超过 10MB，请先缩小图片再上传。")
@@ -964,7 +967,8 @@ def call_toapis(
         mime = item.get("mime") or mimetypes.guess_type(path.name)[0] or "image/png"
         if req.model == routes.FAST_MODEL:
             path, mime = routes.fast_input(path), "image/jpeg"
-        image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client))
+        image_urls.append(toapis_upload_image(api_base, api_key, path, mime, client,
+                                             preserve_details=item.get("role") == "annotation"))
 
     metadata: dict[str, Any] = {}
     resolution = toapis_resolution_tier(req.image_size)
@@ -1034,7 +1038,7 @@ def call_toapis(
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     last_error = ""
-    attempts = 1 if mask_path or req.model == routes.FAST_MODEL else TOAPIS_IMAGE_RETRY_ATTEMPTS
+    attempts = 1 if mask_path or annotations.needed(req) or req.model == routes.FAST_MODEL else TOAPIS_IMAGE_RETRY_ATTEMPTS
     for attempt in range(1, attempts + 1):
         if progress:
             progress.update("submitting")
@@ -1336,8 +1340,7 @@ def image_role_instruction(index: int, role: str) -> str:
 
 def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
     prompt = req.prompt.strip() or "Generate a clean professional image."
-    annotation_edit = any(image.role == "annotation" for image in req.images) or (bool(req.images) and bool(re.search(
-        r"涂鸦|标注|批注|圈[出选]|修改意见|\b(?:scribbles?|annotations?|markup|marked[ -]up)\b", prompt, re.I)))
+    annotation_edit = annotations.needed(req)
     annotation_instruction = (
         "ANNOTATION EDIT INSTRUCTIONS: Follow only annotations the user asks to apply; a request to erase "
         "annotations alone must not execute them. When the user refers to an annotated/marked image, read its written "
@@ -1349,6 +1352,21 @@ def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
         "Use other references only for their requested purpose. Return a clean edited image without the instruction "
         "text, arrows or scribbles; merely removing the marks without performing the edits is not sufficient."
     )
+    if annotation_edit:
+        # Annotation editing is a constrained edit, not generic reference fusion.
+        # Keep the same instruction stack for GPT and Banana to avoid style/identity conflicts.
+        prompt_images = [image for image in req.images if image.role != "mask"]
+        lines = ["编辑附件1的原始效果图。附件中的批注是修改指令，不是需要复制的画面内容。", "用户本次要求：", prompt,
+                 "图片顺序与用途："]
+        lines.extend(image_role_instruction(index, "main" if index == 1 else image.role) for index, image in enumerate(prompt_images, 1))
+        lines.extend([annotation_instruction,
+                      "严格区分修改范围和材质参考：框选/圈选的表面只在圈定范围内修改，不得把参考材质扩散到其他区域。新增立体物体按标记的落地点定位，完整轮廓可以自然展开。除用户明确要求或清单所列修改外，不删除原有物体，不改动建筑、景观或构图。"])
+        if req.negative_prompt.strip():
+            lines.extend(["避免：", req.negative_prompt.strip()])
+        if any(image.role == "mask" for image in req.images):
+            lines.append("另附遮罩，仅在允许修改的选区内编辑。")
+        lines.append("只输出完成逐项修改后的干净图片，不输出说明文字、坐标或批注。")
+        return "\n\n".join(lines)
     if is_banana_provider(provider):
         lines = [
             "The user prompt is the source of truth. Follow it literally and directly.",
@@ -1365,8 +1383,6 @@ def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
                 lines.append(f"Image {index}: {label}.")
         if req.negative_prompt.strip():
             lines.extend(["Avoid:", req.negative_prompt.strip()])
-        if annotation_edit:
-            lines.append(annotation_instruction)
         lines.append("Return only the final edited/generated image. No labels, watermarks, UI, or annotation marks unless requested.")
         return "\n\n".join(lines)
 
@@ -1379,10 +1395,7 @@ def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
             lines.append(image_role_instruction(index, role))
         if any(image.role == "mask" for image in req.images):
             lines.append("A mask image is supplied separately. Edit only the masked area and preserve everything outside it.")
-        if annotation_edit:
-            lines.append(annotation_instruction)
-        else:
-            lines.append("Priority rule: Image 1 is always the main image. Later images are supporting references only, in the exact order listed above. Resolve conflicts in favor of Image 1 and the user prompt.")
+        lines.append("Priority rule: Image 1 is always the main image. Later images are supporting references only, in the exact order listed above. Resolve conflicts in favor of Image 1 and the user prompt.")
     if req.negative_prompt.strip():
         lines.extend(["Avoid:", req.negative_prompt.strip()])
     lines.append("Return only final usable images, with no UI, labels, watermarks, or annotation marks unless requested.")
@@ -1818,6 +1831,17 @@ def generate(req: GenerateRequest, on_progress=None, cache_scope="") -> dict[str
     (run_path / "request.json").write_text(json.dumps(request_log, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
+        if not is_video_model(req.model) and annotations.needed(req):
+            if provider != "toapis":
+                raise ValueError("批注读取需要配置 ToAPIs 视觉通道；本次尚未提交生图")
+            progress.update("reading_annotations")
+            plan = annotations.read(req, saved_inputs, resolve_toapis_base_url(base_url), api_key,
+                                    toapis_http_client(), DATA_DIR.parent / "render-audits" / f"{run_id}-annotations.json")
+            effective_prompt += "\n\n" + annotations.prompt(plan)
+            request_log["effectivePrompt"] = effective_prompt
+            request_log["annotationPlan"] = plan
+            (run_path / "request.json").write_text(json.dumps(request_log, ensure_ascii=False, indent=2), encoding="utf-8")
+            progress.update("annotations_ready", annotationPlan=plan)
         if provider == "toapis":
             if is_video_model(req.model or ""):
                 api_response = call_toapis_video(req, effective_prompt, saved_inputs, saved_video_inputs, api_key, base_url)
@@ -1902,6 +1926,8 @@ def save_generation_outputs(req: GenerateRequest, run_id: str, api_response: dic
         raise delivery.DeliveryPending(run_id, "已生成，原图传输中断；请继续取图，不会重新生图或再次扣费")
     result = {"ok": True, "runId": run_id, "status": "succeeded", "outputs": outputs,
               "remoteUrls": remote_urls, "errors": [], "message": "generated"}
+    if progress.data.get("annotationPlan"):
+        result["annotationPlan"] = progress.data["annotationPlan"]
     if req.model == routes.FAST_MODEL:
         result["billing"] = api_response["billing"]
     (run_path / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")

@@ -76,7 +76,7 @@ class ReferenceUploadTests(unittest.TestCase):
         files = [{"file": "main.png", "role": "main"}, {"file": "reference.png", "role": "reference"}]
         with patch.object(core, "resolve_toapis_base_url", return_value="https://example.test"), \
              patch.object(core, "toapis_http_client", return_value=client), \
-             patch.object(core, "toapis_upload_image", side_effect=lambda a, k, p, m, c: "https://example.test/" + p.name), \
+             patch.object(core, "toapis_upload_image", side_effect=lambda a, k, p, m, c, **kw: "https://example.test/" + p.name), \
              patch.object(core.time, "sleep"):
             core.call_toapis(core.GenerateRequest(model="gpt-image-2.5", imageSize="low", aspectRatio="16:9"), "test", files, "not-a-real-key", "")
         payload = client.post.call_args.kwargs["json"]

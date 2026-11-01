@@ -137,6 +137,29 @@ class GenerationRateLimitTests(unittest.TestCase):
         self.assertEqual(self.request("no-credit").status_code, 402)
         self.assertEqual(self.rate_count(), 0)
 
+    def test_restart_refunds_only_unsubmitted_annotation_tasks_once(self):
+        import json
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(self.gateway.render_core, "JOB_STATE_DIR", root / "jobs"))
+        self.enterContext(patch.object(self.gateway.render_core, "RUN_DIR", root / "runs"))
+        (root / "jobs").mkdir()
+        stages = ["reading_annotations", "annotations_ready", "uploading", "submitting", "waiting"]
+        with self.gateway.transaction() as db:
+            for index, stage in enumerate(stages):
+                run = f"annotation-{index}"
+                state = {"stage": stage, "annotationPlan": {"ready": True}}
+                if stage == "waiting": state["upstreamTaskId"] = "existing-paid-task"
+                (root / "jobs" / (run + ".json")).write_text(json.dumps(state), encoding="utf-8")
+                db.execute("INSERT INTO render_jobs(id,user_id,idempotency_key,model,credits,status,run_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                           (run, "test-user", run, "gpt-image-2.5", 5, "reserved", run, 0))
+        self.gateway.refund_interrupted_annotation_jobs()
+        self.gateway.refund_interrupted_annotation_jobs()
+        with closing(self.gateway.db()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM render_jobs WHERE status='failed'").fetchone()[0], 3)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM credit_ledger WHERE reason='render_refund'").fetchone()[0], 3)
+            self.assertEqual(db.execute("SELECT status FROM render_jobs WHERE id='annotation-3'").fetchone()[0], "reserved")
+            self.assertEqual(db.execute("SELECT status FROM render_jobs WHERE id='annotation-4'").fetchone()[0], "reserved")
+
     def test_real_limit_returns_retry_after_without_charging(self):
         for _ in range(60):
             rate_limit.check_rate_limit("gen_user", "test-user", 60, 3600)
