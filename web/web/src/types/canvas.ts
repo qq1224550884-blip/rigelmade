@@ -50,6 +50,13 @@ export type CanvasNodeMetadata = {
     audioSpeed?: string;
     audioInstructions?: string;
     references?: string[];
+    referenceRoles?: Record<string, import("./image").ImageReferenceRole>;
+    referenceOrder?: string[];
+    referenceRolesByIndex?: import("./image").ImageReferenceRole[];
+    annotationNotes?: string;
+    editMaskStorageKey?: string;
+    annotationLockOutside?: boolean;
+    annotations?: Array<{ id: string; x: number; y: number; width: number; height: number; text: string }>;
     naturalWidth?: number;
     naturalHeight?: number;
     freeResize?: boolean;

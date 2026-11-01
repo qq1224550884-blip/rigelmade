@@ -7,6 +7,7 @@ import { formatBytes } from "@/lib/image-utils";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { buildNodeContext } from "@/lib/canvas/plugin-node-context";
 import { useThemeStore } from "@/stores/use-theme-store";
+import { useCanvasImageSource } from "@/hooks/use-canvas-image-source";
 import { CanvasResourceMentionTextarea } from "./canvas-resource-mention-textarea";
 import { CanvasNodeType, type CanvasNodeData, type Position } from "@/types/canvas";
 import type { CanvasNodeContext, CanvasPluginHost } from "@/types/canvas-plugin";
@@ -57,6 +58,7 @@ type CanvasNodeProps = {
 
 type NodeContentRendererProps = {
     node: CanvasNodeData;
+    scale: number;
     theme: (typeof canvasThemes)[keyof typeof canvasThemes];
     isEditingContent: boolean;
     textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -392,6 +394,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                 >
                     <NodeContent
                         node={data}
+                        scale={scale}
                         theme={theme}
                         isEditingContent={isEditingContent}
                         textareaRef={textareaRef}
@@ -588,6 +591,7 @@ function ImageNodeContent(props: NodeContentRendererProps) {
     return (
         <ImageContent
             node={props.node}
+            scale={props.scale}
             isBatchRoot={props.isBatchRoot}
             batchCount={props.batchCount}
             batchExpanded={props.batchExpanded}
@@ -649,6 +653,7 @@ function AudioNodeContent({ node, theme }: NodeContentRendererProps) {
 
 function ImageContent({
     node,
+    scale,
     isBatchRoot,
     batchCount,
     batchExpanded,
@@ -658,6 +663,7 @@ function ImageContent({
     onSetBatchPrimary,
 }: {
     node: CanvasNodeData;
+    scale: number;
     isBatchRoot: boolean;
     batchCount: number;
     batchExpanded: boolean;
@@ -668,12 +674,13 @@ function ImageContent({
 }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const isBatchChild = Boolean(node.metadata?.batchRootId);
+    const source = useCanvasImageSource(node.metadata?.storageKey, node.metadata?.content || "", Math.max(node.width, node.height) * scale);
 
     return (
         <BatchFrame batchCount={isBatchRoot ? batchCount : 0} batchExpanded={batchExpanded} batchOpening={batchOpening} batchRecovering={batchRecovering} onToggleBatch={onToggleBatch}>
             <div className="h-full w-full overflow-hidden rounded-3xl">
                 <img
-                    src={node.metadata!.content!}
+                    src={source}
                     alt={node.title}
                     draggable={false}
                     onDragStart={(event) => event.preventDefault()}

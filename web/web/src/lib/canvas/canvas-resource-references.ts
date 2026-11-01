@@ -1,6 +1,7 @@
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { seedanceReferenceLabel } from "@/lib/seedance-video";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
+import { orderReferenceNodes } from "./canvas-reference-order";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "@/types/canvas";
 
 export type CanvasResourceKind = "image" | "video" | "audio" | "text";
@@ -17,7 +18,8 @@ export type CanvasResourceReference = {
 };
 
 export function buildNodeMentionReferences(node: CanvasNodeData, nodes: CanvasNodeData[], connections: CanvasConnection[]) {
-    return labelResourceNodes(getMentionResourceNodes(node.id, nodes, connections), true);
+    const inputs = orderReferenceNodes(getMentionResourceNodes(node.id, nodes, connections), node);
+    return labelResourceNodes(node.type === CanvasNodeType.Image && node.metadata?.content ? [node, ...inputs.filter((item) => item.id !== node.id)] : inputs, true);
 }
 
 export function getMentionResourceNodes(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]) {

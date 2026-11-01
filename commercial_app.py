@@ -903,17 +903,27 @@ async def commercial_image_edits(
     quality: str = Form("low"),
     size: str = Form("1024x1024"),
     mask: UploadFile | None = File(None),
+    image_roles: str = Form(""),
     x_idempotency_key: str | None = Header(default=None),
     prefer: str | None = Header(default=None),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
     images: list[render_core.GenerateImage] = []
+    roles = ["main"] + ["reference"] * (len(image) - 1)
+    if image_roles:
+        try:
+            roles = json.loads(image_roles)
+            allowed = {"main", "annotation", "material", "structure", "lighting", "style", "content", "reference"}
+            if not isinstance(roles, list) or len(roles) != len(image) or any(role not in allowed for role in roles) or roles.count("main") != 1 or roles[0] != "main":
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise HTTPException(400, "参考图用途无效；第一张必须是唯一底图。")
     for index, upload in enumerate(image, start=1):
         mime = upload.content_type or "image/png"
         if not mime.startswith("image/"):
             raise HTTPException(status_code=400, detail="只支持图片参考图。")
         raw = await upload.read()
-        images.append(render_core.GenerateImage(name=upload.filename or f"image-{index}.png", role="main" if index == 1 else "reference", dataUrl=f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"))
+        images.append(render_core.GenerateImage(name=upload.filename or f"image-{index}.png", role=roles[index - 1], dataUrl=f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"))
     if mask is not None:
         mime = mask.content_type or "image/png"
         if not mime.startswith("image/"):
@@ -1049,6 +1059,10 @@ def enforce_generation_rate_limit(request: Request, user_id: str) -> list[tuple[
     if wait:
         raise HTTPException(status_code=429, detail=f"生成频率过高，请约 {wait} 秒后再试。", headers={"Retry-After": str(wait)})
     return events
+
+
+from canvas_service import build_canvas_router
+app.include_router(build_canvas_router(current_user, DATA_DIR / "canvas-private"))
 
 
 if __name__ == "__main__":

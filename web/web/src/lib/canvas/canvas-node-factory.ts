@@ -40,7 +40,7 @@ export function referenceUrl(image: ReferenceImage) {
     return image.storageKey || image.url || (!image.dataUrl.startsWith("data:") ? image.dataUrl : undefined);
 }
 
-export function buildImageGenerationMetadata(type: CanvasImageGenerationType, config: AiConfig, count: number, references: ReferenceImage[]): CanvasNodeMetadata {
+export function buildImageGenerationMetadata(type: CanvasImageGenerationType, config: AiConfig, count: number, references: ReferenceImage[], mask?: ReferenceImage): CanvasNodeMetadata {
     return {
         generationType: type,
         model: config.model,
@@ -49,6 +49,10 @@ export function buildImageGenerationMetadata(type: CanvasImageGenerationType, co
         ...(config.background ? { background: config.background } : {}),
         count,
         references: references.map(referenceUrl).filter((url): url is string => Boolean(url)),
+        referenceRolesByIndex: references.map((image, index) => image.role || (index === 0 ? "main" : "reference")),
+        referenceRoles: Object.fromEntries(references.map((image, index) => [image.id, image.role || (index === 0 ? "main" : "reference")])),
+        referenceOrder: references.map((image) => image.id),
+        editMaskStorageKey: mask?.storageKey,
     };
 }
 

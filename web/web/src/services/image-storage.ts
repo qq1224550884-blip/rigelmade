@@ -2,6 +2,7 @@ import localforage from "localforage";
 
 import { nanoid } from "nanoid";
 import { readImageMeta } from "@/lib/image-utils";
+import { createImageThumbnail } from "@/lib/image-thumbnail";
 
 export type UploadedImage = {
     url: string;
@@ -14,6 +15,39 @@ export type UploadedImage = {
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
 const objectUrls = new Map<string, string>();
+const previews = localforage.createInstance({ name: "infinite-canvas", storeName: "image_previews" });
+const previewUrls = new Map<string, string>();
+const previewTasks = new Map<string, Promise<string>>();
+let previewQueue: Promise<unknown> = Promise.resolve();
+
+export function ensureImagePreview(storageKey: string): Promise<string> {
+    if (previewUrls.has(storageKey)) return Promise.resolve(previewUrls.get(storageKey)!);
+    if (previewTasks.has(storageKey)) return previewTasks.get(storageKey)!;
+    const task = previewQueue.then(async () => {
+        let blob = await previews.getItem<Blob>(storageKey);
+        if (!blob) {
+            const original = await store.getItem<Blob>(storageKey);
+            if (!original) return "";
+            blob = await createImageThumbnail(original);
+            if (!blob) return "";
+            await previews.setItem(storageKey, blob);
+        }
+        const url = URL.createObjectURL(blob);
+        previewUrls.set(storageKey, url);
+        return url;
+    }).catch(() => "").finally(() => previewTasks.delete(storageKey));
+    previewQueue = task;
+    previewTasks.set(storageKey, task);
+    return task;
+}
+
+async function clearPreview(key: string) {
+    await previewTasks.get(key);
+    const url = previewUrls.get(key);
+    if (url) URL.revokeObjectURL(url);
+    previewUrls.delete(key);
+    await previews.removeItem(key);
+}
 
 export async function uploadImage(input: string | Blob): Promise<UploadedImage> {
     const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
@@ -41,6 +75,7 @@ export async function getImageBlob(storageKey: string) {
 }
 
 export async function setImageBlob(storageKey: string, blob: Blob) {
+    await clearPreview(storageKey);
     await store.setItem(storageKey, blob);
     const url = URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
@@ -59,6 +94,7 @@ export async function deleteStoredImages(keys: Iterable<string>) {
             const url = objectUrls.get(key);
             if (url) URL.revokeObjectURL(url);
             objectUrls.delete(key);
+            await clearPreview(key);
             await store.removeItem(key);
         }),
     );
@@ -74,6 +110,7 @@ export async function cleanupUnusedImages(usedData: unknown) {
 }
 
 export function collectImageStorageKeys(value: unknown, keys = new Set<string>()) {
+    if (typeof value === "string" && value.startsWith("image:")) keys.add(value);
     if (!value || typeof value !== "object") return keys;
     if ("storageKey" in value && typeof value.storageKey === "string" && value.storageKey.startsWith("image:")) keys.add(value.storageKey);
     Object.values(value).forEach((item) => (Array.isArray(item) ? item.forEach((child) => collectImageStorageKeys(child, keys)) : collectImageStorageKeys(item, keys)));

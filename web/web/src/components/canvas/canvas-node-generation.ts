@@ -5,9 +5,11 @@ import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "@/types/canvas";
 import { getGenerationResourceNodes } from "@/lib/canvas/canvas-resource-references";
+import { orderReferenceNodes } from "@/lib/canvas/canvas-reference-order";
 
 export type NodeGenerationContext = {
     prompt: string;
+    mask?: ReferenceImage;
     referenceImages: ReferenceImage[];
     referenceVideos: ReferenceVideo[];
     referenceAudios: ReferenceAudio[];
@@ -28,6 +30,24 @@ export type NodeGenerationInput = {
 };
 
 export function buildNodeGenerationContext(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[], prompt: string): NodeGenerationContext {
+    const context = buildRawNodeGenerationContext(nodeId, nodes, connections, prompt);
+    const target = nodes.find((node) => node.id === nodeId);
+    if (target?.metadata?.editMaskStorageKey) context.mask = { id: "edit-mask", name: "mask.png", type: "image/png", storageKey: target.metadata.editMaskStorageKey, dataUrl: "" };
+    const own = target ? readReferenceImage(target) : null;
+    const allImages = own ? [own, ...context.referenceImages.filter((image) => image.id !== own.id)] : context.referenceImages;
+    const ordered = orderReferenceNodes(nodes.filter((node) => allImages.some((image) => image.id === node.id)), target);
+    const rank = new Map(ordered.map((node, index) => [node.id, index]));
+    const sorted = [...allImages].sort((a, b) => (rank.get(a.id) ?? 999) - (rank.get(b.id) ?? 999));
+    const images = own ? [own, ...sorted.filter((image) => image.id !== own.id)] : sorted;
+    const labels = new Map(context.referenceImages.map((image, index) => [`图片${index + 1}`, `图片${images.indexOf(image) + 1}`]));
+    if (target?.type === CanvasNodeType.Config && target.metadata?.composerContent?.trim()) context.prompt = context.prompt.replace(/图片\d+/g, (label) => labels.get(label) || label);
+    context.referenceImages = images.map((image, index) => ({ ...image, role: index === 0 ? "main" : target?.metadata?.referenceRoles?.[image.id] === "main" ? "reference" : target?.metadata?.referenceRoles?.[image.id] || "reference" }));
+    context.imageCount = context.referenceImages.length;
+    if (target?.metadata?.annotationNotes?.trim()) context.prompt += `\n\n已核对的批注修改清单（逐项执行）：\n${target.metadata.annotationNotes.trim()}\n未提及区域保持底图，完成修改后去除批注标记。`;
+    return context;
+}
+
+function buildRawNodeGenerationContext(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[], prompt: string): NodeGenerationContext {
     const inputs = buildNodeGenerationInputs(nodeId, nodes, connections);
     const sourceNode = nodes.find((node) => node.id === nodeId);
     if (sourceNode?.type === CanvasNodeType.Config && Boolean(sourceNode.metadata?.composerContent?.trim())) {
@@ -114,7 +134,7 @@ function buildComposerGenerationContext(inputs: NodeGenerationInput[], prompt: s
 }
 
 export function buildNodeGenerationInputs(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]): NodeGenerationInput[] {
-    return getGenerationResourceNodes(nodeId, nodes, connections).flatMap((node): NodeGenerationInput[] => {
+    return orderReferenceNodes(getGenerationResourceNodes(nodeId, nodes, connections), nodes.find((node) => node.id === nodeId)).flatMap((node): NodeGenerationInput[] => {
         const image = readReferenceImage(node);
         if (image) return [{ nodeId: node.id, type: "image" as const, title: node.title, image }];
         const video = readReferenceVideo(node);
@@ -142,7 +162,7 @@ export function buildNodeResponseMessages(context: NodeGenerationContext): AiTex
 
 export async function hydrateNodeGenerationContext(context: NodeGenerationContext) {
     const { imageToDataUrl } = await import("@/services/image-storage");
-    return { ...context, referenceImages: await Promise.all(context.referenceImages.map(async (image) => ({ ...image, dataUrl: await imageToDataUrl(image) }))) };
+    return { ...context, mask: context.mask ? { ...context.mask, dataUrl: await imageToDataUrl(context.mask) } : undefined, referenceImages: await Promise.all(context.referenceImages.map(async (image) => ({ ...image, dataUrl: await imageToDataUrl(image) }))) };
 }
 
 function readNodeTextInput(node: CanvasNodeData) {

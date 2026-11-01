@@ -18,6 +18,7 @@ export type CanvasProject = {
     backgroundMode: CanvasBackgroundMode;
     showImageInfo: boolean;
     viewport: ViewportTransform;
+    cloud?: { owner: string; id: string; revision: number; savedAt: string };
 };
 
 type CanvasStore = {
@@ -29,7 +30,7 @@ type CanvasStore = {
     renameProject: (id: string, title: string) => void;
     deleteProjects: (ids: string[]) => void;
     replaceProjects: (projects: CanvasProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport">>) => void;
+    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "cloud">>) => void;
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
@@ -116,7 +117,7 @@ export const useCanvasStore = create<CanvasStore>()(
             replaceProjects: (projects) => set({ projects }),
             updateProject: (id, patch) =>
                 set((state) => ({
-                    projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
+                    projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: Object.keys(patch).every((key) => key === "cloud") ? project.updatedAt : new Date().toISOString() } : project)),
                 })),
         }),
         {

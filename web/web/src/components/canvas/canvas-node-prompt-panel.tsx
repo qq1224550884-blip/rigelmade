@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowUp, Image as ImageIcon, LoaderCircle, Maximize2, Square, X } from "lucide-react";
+import { ArrowUp, LoaderCircle, Maximize2, Square } from "lucide-react";
 import { Button, Modal, Tooltip } from "antd";
 
 import { ModelPicker } from "@/components/model-picker";
@@ -7,6 +7,7 @@ import { defaultConfig, resolveModelForCapability, useConfigStore, useEffectiveC
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
+import { CanvasReferenceEditor } from "./canvas-reference-editor";
 import { CanvasPromptLibrary } from "./canvas-prompt-library";
 import { CanvasAudioSettingsPopover, type CanvasAudioSettingKey } from "./canvas-audio-settings-popover";
 import { CanvasPromptChipInput } from "./canvas-prompt-chip-input";
@@ -41,7 +42,6 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
     const isEditingExistingContent = hasTextContent || hasImageContent;
     const [prompt, setPrompt] = useState(node.metadata?.prompt || "");
     const [expanded, setExpanded] = useState(false);
-    const imageReferences = mentionReferences.filter((reference) => reference.active && reference.kind === "image");
 
     // 仅在切换到其它节点时恢复对应提示词;同一节点生成完成后继续保留当前输入。
     useEffect(() => {
@@ -83,32 +83,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
                 placeholder={promptPlaceholder(mode, hasImageContent, hasTextContent)}
             />
 
-            {mode === "image" && imageReferences.length ? (
-                <div className="mt-2 rounded-xl border px-2.5 py-2" style={{ borderColor: theme.toolbar.border, background: `${theme.node.fill}66` }}>
-                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px]" style={{ color: theme.node.placeholder }}>
-                        <ImageIcon className="size-3" />
-                        <span>本次输入顺序：提示词可直接写“图片1、图片2”</span>
-                    </div>
-                    <div className="flex min-w-0 gap-2 overflow-x-auto pb-0.5">
-                        {imageReferences.map((reference) => (
-                            <div key={reference.id} className="group relative flex h-12 min-w-0 items-center gap-2 rounded-lg border pr-7" style={{ borderColor: theme.node.stroke, background: theme.toolbar.panel }}>
-                                {reference.previewUrl ? <img src={reference.previewUrl} alt={reference.title} className="size-11 rounded-l-md object-cover" /> : <span className="flex size-11 items-center justify-center rounded-l-md" style={{ background: theme.node.fill }}><ImageIcon className="size-4" /></span>}
-                                <span className="max-w-24 truncate pr-1 text-xs font-semibold">{reference.label}</span>
-                                <button
-                                    type="button"
-                                    className="absolute right-1 top-1 flex size-5 items-center justify-center rounded-md opacity-60 transition hover:opacity-100"
-                                    style={{ color: theme.node.text, background: theme.node.fill }}
-                                    aria-label={`取消 ${reference.label}`}
-                                    title={`取消 ${reference.label}`}
-                                    onClick={() => onRemoveReference?.(node.id, reference.nodeId)}
-                                >
-                                    <X className="size-3" />
-                                </button>
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            ) : null}
+            {mode === "image" ? <CanvasReferenceEditor node={node} references={mentionReferences} onChange={onConfigChange} onRemove={onRemoveReference} /> : null}
 
             <div className="mt-2 flex min-w-0 items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">

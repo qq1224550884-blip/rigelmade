@@ -942,6 +942,7 @@ def call_toapis(
     input_files: list[dict[str, Any]],
     api_key: str,
     base_url: str,
+    audit_path: Path | None = None,
     progress: delivery.RunProgress | None = None,
 ) -> dict[str, Any]:
     """Call toapis async image generation (POST task + GET poll)."""
@@ -1013,10 +1014,24 @@ def call_toapis(
         payload[image_field].append(toapis_upload_image(api_base, api_key, guide, "image/png", client))
         payload["prompt"] = (
             prompt + "\nThe LAST attachment is ONLY a selection guide for attachment 1: magenta tint marks the editable region. "
-            "Apply the requested material only there; remove all magenta guide tint in the result. "
-            "Attachments between the first and last are material references only. Keep the exact camera, geometry, "
+            "Apply the requested edits only there; remove all magenta guide tint in the result. "
+            "Use other attachments only for their explicitly assigned reference roles. Keep the exact camera, geometry, "
             "image aspect ratio and all other regions unchanged. Return the complete image, not a crop."
         )
+
+    if audit_path is not None:
+        # 保存真正提交的型号、顺序和提示词；不记录密钥或上游素材地址。
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        order = [item.get("role", "reference") for item in input_files if item.get("role") != "mask"]
+        if mask_path and model != "gpt-image-2":
+            order.append("selection-guide")
+        audit_path.write_text(json.dumps({
+            "requestedModel": req.model, "upstreamModel": model,
+            "imageField": image_field, "imageCount": len(payload.get(image_field, [])),
+            "imageOrder": order, "hasNativeMask": "mask_url" in payload,
+            "size": payload["size"], "resolution": resolution,
+            "prompt": payload["prompt"],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     last_error = ""
     attempts = 1 if mask_path or req.model == routes.FAST_MODEL else TOAPIS_IMAGE_RETRY_ATTEMPTS
@@ -1307,6 +1322,7 @@ def mode_instruction(mode: str) -> str:
 def image_role_instruction(index: int, role: str) -> str:
     role_options = {
         "main": "MAIN IMAGE. Treat this as the base image and primary subject to edit. Preserve identity, pose/composition, camera, and unmentioned details unless the user explicitly requests a change.",
+        "annotation": "ANNOTATION GUIDE. Read its written instructions including Chinese text, colored outlines, arrows and doodles as requested edits and location guides for Image 1. Execute the edits, then remove the marks. This is not a material or style reference.",
         "structure": "STRUCTURE REFERENCE. Use only its spatial organization, geometry, proportions, camera logic, and construction relationships. Do not copy its materials or style unless requested.",
         "material": "MATERIAL REFERENCE. Use its material palette, texture scale, surface finish, reflections, and physical realism. Do not replace the main image layout.",
         "lighting": "LIGHTING REFERENCE. Use its light direction, softness, contrast, exposure, shadow character, and atmosphere. Do not copy unrelated objects.",
@@ -1320,6 +1336,19 @@ def image_role_instruction(index: int, role: str) -> str:
 
 def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
     prompt = req.prompt.strip() or "Generate a clean professional image."
+    annotation_edit = any(image.role == "annotation" for image in req.images) or (bool(req.images) and bool(re.search(
+        r"涂鸦|标注|批注|圈[出选]|修改意见|\b(?:scribbles?|annotations?|markup|marked[ -]up)\b", prompt, re.I)))
+    annotation_instruction = (
+        "ANNOTATION EDIT INSTRUCTIONS: Follow only annotations the user asks to apply; a request to erase "
+        "annotations alone must not execute them. When the user refers to an annotated/marked image, read its written "
+        "instructions (including Chinese text), colored outlines, arrows and drawn silhouettes as edit instructions "
+        "and location guides for the base image, not as ordinary style/material references or scene content. "
+        "Map the indicated locations to Image 1 using the scene geometry, even if image resolutions differ. "
+        "Apply each requested addition/replacement at its marked location; these explicit edits take priority over "
+        "preserving the original objects at those locations. Preserve unmentioned regions. "
+        "Use other references only for their requested purpose. Return a clean edited image without the instruction "
+        "text, arrows or scribbles; merely removing the marks without performing the edits is not sufficient."
+    )
     if is_banana_provider(provider):
         lines = [
             "The user prompt is the source of truth. Follow it literally and directly.",
@@ -1336,6 +1365,8 @@ def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
                 lines.append(f"Image {index}: {label}.")
         if req.negative_prompt.strip():
             lines.extend(["Avoid:", req.negative_prompt.strip()])
+        if annotation_edit:
+            lines.append(annotation_instruction)
         lines.append("Return only the final edited/generated image. No labels, watermarks, UI, or annotation marks unless requested.")
         return "\n\n".join(lines)
 
@@ -1348,7 +1379,10 @@ def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
             lines.append(image_role_instruction(index, role))
         if any(image.role == "mask" for image in req.images):
             lines.append("A mask image is supplied separately. Edit only the masked area and preserve everything outside it.")
-        lines.append("Priority rule: Image 1 is always the main image. Later images are supporting references only, in the exact order listed above. Resolve conflicts in favor of Image 1 and the user prompt.")
+        if annotation_edit:
+            lines.append(annotation_instruction)
+        else:
+            lines.append("Priority rule: Image 1 is always the main image. Later images are supporting references only, in the exact order listed above. Resolve conflicts in favor of Image 1 and the user prompt.")
     if req.negative_prompt.strip():
         lines.extend(["Avoid:", req.negative_prompt.strip()])
     lines.append("Return only final usable images, with no UI, labels, watermarks, or annotation marks unless requested.")
@@ -1357,6 +1391,7 @@ def build_prompt(req: GenerateRequest, provider: str = "gpt") -> str:
 
 def reference_role_plain(role: str) -> str:
     labels = {
+        "annotation": "annotation guide: written edits and location marks for the main image",
         "structure": "structure",
         "material": "material",
         "lighting": "lighting",
@@ -1789,6 +1824,7 @@ def generate(req: GenerateRequest, on_progress=None, cache_scope="") -> dict[str
             else:
                 with delivery.upload_scope(cache_scope, progress.upload):
                     api_response = call_toapis(req, effective_prompt, saved_inputs, api_key, base_url,
+                                              DATA_DIR.parent / "render-audits" / f"{run_id}-upstream-request.json",
                                               progress=progress)
         elif req.model == "nano-banana-2":
             api_response = call_gemini_native(req, effective_prompt, saved_inputs, api_key, base_url)

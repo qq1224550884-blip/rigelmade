@@ -45,10 +45,10 @@ export function clearCommercialSession() {
 export async function commercialRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
     const session = readCommercialSession();
     const headers = new Headers(init.headers);
-    if (session?.token) headers.set("Authorization", `Bearer ${session.token}`);
-    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    if (session?.token && !headers.has("Authorization")) headers.set("Authorization", `Bearer ${session.token}`);
+    if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     const response = await fetch(path, { ...init, headers });
     const value = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(value.detail || "请求失败");
+    if (!response.ok) throw new Error(typeof value.detail === "string" ? value.detail : value.detail?.message || "请求失败");
     return value as T;
 }

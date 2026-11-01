@@ -8,6 +8,10 @@ import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
 
 export async function exportCanvasProjects(projects: CanvasProject[], fileName = "无限画布") {
+    saveAs(await createCanvasArchive(projects), `${safeFileName(fileName)}.zip`);
+}
+
+export async function createCanvasArchive(projects: CanvasProject[], strict = false) {
     const zipFiles: { name: string; data: BlobPart }[] = [];
     const exportedProjects = await Promise.all(
         projects.map(async (project) => {
@@ -15,7 +19,10 @@ export async function exportCanvasProjects(projects: CanvasProject[], fileName =
             await Promise.all(
                 collectStorageKeys(project).map(async (storageKey) => {
                     const blob = storageKey.startsWith("image:") ? await getImageBlob(storageKey) : await getMediaBlob(storageKey);
-                    if (!blob) return;
+                    if (!blob) {
+                        if (strict) throw new Error("项目中有原图尚未加载或已丢失，请重新打开图片后保存到账号。");
+                        return;
+                    }
                     const path = `projects/${project.id}/files/${safeFileName(storageKey)}.${fileExtension(blob.type, storageKey)}`;
                     files.push({ storageKey, path, mimeType: blob.type || "application/octet-stream", bytes: blob.size });
                     zipFiles.push({ name: path, data: blob });
@@ -27,7 +34,7 @@ export async function exportCanvasProjects(projects: CanvasProject[], fileName =
 
     const data: CanvasExportFile = { app: "infinite-canvas", version: 3, exportedAt: new Date().toISOString(), projects: exportedProjects };
     const zip = await createZip([{ name: "projects.json", data: JSON.stringify(data, null, 2) }, ...zipFiles]);
-    saveAs(zip, `${safeFileName(fileName)}.zip`);
+    return zip;
 }
 
 export async function exportCanvasNodes(nodes: CanvasNodeData[], fileName = "画布元素") {
@@ -64,6 +71,7 @@ export async function exportCanvasNodes(nodes: CanvasNodeData[], fileName = "画
 }
 
 function collectStorageKeys(value: unknown, keys = new Set<string>()) {
+    if (typeof value === "string" && /^(image|video|audio|file):/.test(value)) keys.add(value);
     if (!value || typeof value !== "object") return [...keys];
     if ("storageKey" in value && typeof value.storageKey === "string" && value.storageKey.includes(":")) keys.add(value.storageKey);
     Object.values(value).forEach((item) => (Array.isArray(item) ? item.forEach((child) => collectStorageKeys(child, keys)) : collectStorageKeys(item, keys)));

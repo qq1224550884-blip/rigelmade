@@ -828,6 +828,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
 
 export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    if (requestConfig.model === "gpt-image-2.5-fast" && (references.length > 1 || references.some((image) => image.role === "annotation"))) throw new Error("快速预览仅支持一张底图。批注图和多参考图请先改选日常 Flare 或 Sunburst 精修，尚未提交生成请求。");
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const requestPrompt = buildImageReferencePromptText(prompt, references);
     const script = resolveModelScript(config, config.model || config.imageModel);
@@ -916,6 +917,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 
     try {
         const url = aiApiUrl(requestConfig, "/images/edits");
+        if (isWorkbenchImageApi(url)) formData.set("image_roles", JSON.stringify(references.map((image, index) => image.role || (index === 0 ? "main" : "reference"))));
         const response = isWorkbenchImageApi(url)
             ? { data: await requestWorkbenchImage(url, formData, aiHeaders(requestConfig), options) }
             : await axios.post<ImageApiResponse>(url, formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
